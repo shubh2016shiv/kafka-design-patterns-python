@@ -1,260 +1,739 @@
-# Chapter 5: Priority Architecture — Building Tiered Service Levels in Kafka
+# Chapter 5: Priority Architecture - Turning Business Urgency into Kafka Design
 
-## Why Priority Cannot Be a Single Configuration Switch
+## Why "Priority" in Kafka Is Often Misunderstood
 
-Engineers new to Kafka often assume there must be a simple parameter — something like `message.priority = HIGH` — that tells the broker to process certain messages before others. There is not. This is an intentional design decision, not an oversight.
+When people first hear "high-priority events" and "low-priority events," they often imagine a simple broker-level switch:
 
-Kafka's core design is built around sequential, ordered log entries within a partition. If the broker tried to reorder messages by priority, it would break the ordering guarantees that make Kafka useful for event sourcing, state machines, and transaction processing. Priority processing in Kafka is therefore not a feature you enable — it is an architecture you design. The mechanism is separation: you create multiple topics with different configurations, run different consumers against them, and the *combination* of these choices creates different effective service levels.
-
-The goal of this chapter is to move beyond understanding that this separation is possible, and into the specific, concrete decisions that make the separation actually meaningful in production. There is a significant difference between a high-priority topic and a low-priority topic that exist in name only (same configuration, same consumers) and a genuinely tiered architecture where the two tiers provide measurably different latency, reliability, and processing guarantees.
-
-## The Five Configuration Dimensions of Priority
-
-Priority in Kafka emerges from the coordinated difference in five configuration dimensions. Each dimension contributes to the overall effective service level. Changing just one or two dimensions gives you minor improvements. Changing all five in coordination gives you a genuinely tiered architecture.
-
-### Dimension 1: Partition Count (Parallelism Ceiling)
-
-As established in Chapter 2, the partition count determines the maximum number of consumer instances that can read from a topic simultaneously. This is the most direct lever for throughput. A topic with 6 partitions can be consumed by 6 consumers concurrently; a topic with 2 partitions can never benefit from more than 2 consumers, no matter how many you deploy.
-
-```
-Throughput Ceiling by Partition Count:
-
-High Priority Topic (6 partitions):
-  Consumer capacity: up to 6 instances
-  Each instance processes 100 msg/sec
-  Maximum throughput: 600 msg/sec
-
-Low Priority Topic (2 partitions):
-  Consumer capacity: up to 2 instances
-  Each instance processes 100 msg/sec
-  Maximum throughput: 200 msg/sec
+```text
+priority=high
 ```
 
-The partition count must be planned ahead of time with peak load in mind, not current load. If your high-priority topic currently receives 500 messages per second and each consumer handles 200 messages per second, you need 3 consumers and therefore at least 3 partitions. But if you expect traffic to triple over the next year, plan for 9 partitions now — it is much harder to increase partitions safely after data is already flowing.
+and Kafka magically processes those records first.
 
-### Dimension 2: Replication Factor (Durability and Availability)
+Kafka does not work that way.
 
-The replication factor determines how many copies of each partition exist across brokers. This directly affects how many broker failures the system can survive without data loss or availability interruption.
+Kafka preserves order within partitions. It does not look inside a partition and reshuffle records based on urgency.
 
+That means:
+
+- Kafka does not have a native "skip the line" feature inside a partition
+- if urgent and non-urgent records are mixed in the same partition, they still flow in order
+
+So in Kafka, priority is not something you attach to a record and expect the broker to honor automatically.
+
+**Priority in Kafka is an architecture, not a flag.**
+
+You create priority by separating workloads and giving those workloads different:
+
+- topics
+- partitions
+- producer routing rules
+- consumer resources
+- durability settings
+- retention settings
+- alert thresholds
+
+That is what this chapter is about.
+
+## The First Question: Do You Really Need Priority Tiers?
+
+Before designing a high-priority and low-priority setup, ask:
+
+**Do these events actually need meaningfully different service levels?**
+
+Sometimes the answer is yes.
+
+Examples:
+
+- fraud alerts must be acted on in under 200ms
+- analytics export can wait minutes
+- user-facing search index update should be fast
+- nightly reporting can be slow
+
+Sometimes the answer is no.
+
+Examples:
+
+- all events have similar urgency
+- all consumers already keep up comfortably
+- the "priority" idea is just a guess rather than a measured need
+
+### When Priority Tiers Are Worth It
+
+Priority architecture is justified when different workloads have meaningfully different needs for:
+
+- latency
+- throughput
+- durability
+- recovery window
+- consumer resource allocation
+
+### When Priority Tiers Are Overengineering
+
+You probably do not need tiers when:
+
+- event volume is low
+- all events have similar urgency
+- one well-sized topic and one consumer design is enough
+- the operational overhead of multiple topics would outweigh the benefit
+
+### The Core Decision
+
+Priority tiers are worth adding only when:
+
+**letting all records share the same topic and consumer capacity would cause important work to suffer behind less important work**
+
+That is the real test.
+
+## What Priority Actually Means in Kafka
+
+In Kafka, priority means:
+
+**important work gets separate resources, separate expectations, and separate failure boundaries**
+
+Not just separate labels.
+
+If both high-priority and low-priority events:
+
+- go to the same topic
+- share the same partitions
+- share the same consumers
+- share the same lag and failure modes
+
+then you do not actually have a priority architecture.
+
+You just have a naming convention.
+
+## The Simplest Useful Mental Model
+
+Think of a Kafka priority architecture as separate roads.
+
+```text
+Without priority separation:
+
+all vehicles use one road
+ambulances, buses, trucks, and bicycles all queue together
+
+
+With priority separation:
+
+critical traffic gets a fast lane
+background traffic gets a normal lane
 ```
-Replication Factor and Fault Tolerance:
 
-Factor 1: [Leader] only — no copies
-  Broker dies -> Partition is offline until broker recovers
-  Risk of data loss if disk also fails
-  Appropriate for: test data, regeneratable analytics events
+In Kafka terms:
 
-Factor 2: [Leader] + [1 Follower]
-  Broker dies -> Failover to follower (~30 seconds)
-  No data loss if follower was in sync
-  Appropriate for: moderate-importance events
+- high-priority lane = dedicated topic(s) + faster consumers + stronger guarantees
+- low-priority lane = separate topic(s) + lower-cost processing + more relaxed SLAs
 
-Factor 3: [Leader] + [2 Followers]
-  Two brokers can die -> System remains fully operational
-  No data loss
-  Appropriate for: payment data, user events, critical business events
+## The Five Levers That Create Real Priority
 
-Production rule: never use replication factor 1 in production
-for data you care about. The cost (2-3x storage) is almost always
-worth the protection.
-```
+Priority becomes real only when you change actual system behavior.
 
-For high-priority topics, combining replication factor 3 with `min.insync.replicas=2` creates the strongest available guarantee. When `min.insync.replicas=2`, Kafka refuses to acknowledge a write unless at least 2 replicas have confirmed receiving it. This means even if the leader crashes immediately after acknowledging your write, at least one follower has the data and can become the new leader without data loss.
+The most important levers are:
 
-### Dimension 3: Retention Policy (Time-to-Live and Resource Management)
+1. routing
+2. partition count
+3. consumer allocation
+4. durability configuration
+5. retention and replay window
 
-Retention determines how long messages stay in Kafka before being deleted. This might seem unrelated to priority, but it has two important consequences: it controls disk space consumption, and it determines how far back a new consumer can read.
+We will walk through each one.
 
-High-priority topics typically contain time-sensitive events — a payment alert is actionable for hours, not weeks. Keeping these messages for only 24 hours means your disk usage for the high-priority topic stays small and predictable, ensuring there is always available disk capacity for new critical messages. Running out of disk space on your Kafka broker is a catastrophic event that stops all writes to that broker.
+## 1. Routing: Which Events Go to Which Lane?
 
-Low-priority topics often contain batch-processed or analytically valuable events where longer retention is genuinely useful. An analytics system processing daily reports might read events that are 3 days old. A new fraud detection service might need to read 2 weeks of payment history when it first deploys.
+This is the most important decision.
 
-```
-Retention Configuration Interaction with Consumer Lag:
+If routing is wrong, the whole architecture is wrong.
 
-High Priority Topic (retention = 1 day):
-  If your consumer falls 24 hours behind -> messages start getting deleted
-  This is a CRITICAL alert condition — you are losing data
-  Design for this: alert when lag > 1 hour (well before the cliff)
+Ask:
 
-Low Priority Topic (retention = 7 days):
-  Consumer can fall 7 days behind before losing data
-  Much more forgiving of slow consumers or temporary outages
-  A new service can "catch up" by reading a week of history
-```
+**What business rule decides whether an event belongs in the fast lane or the normal lane?**
 
-### Dimension 4: Segment Configuration (Operational Efficiency)
+Example routing rules:
 
-A Kafka partition is stored as a series of **segment files** on disk. Each segment file contains a range of messages. When a segment file is "full" (either by time elapsed or by size), Kafka closes it and opens a new one. Only a closed segment file can be deleted (for retention) or compacted.
+- customer tier is VIP
+- payment amount is above threshold
+- fraud score is above threshold
+- user action is interactive rather than batch
+- event type is operationally urgent
 
-This matters for priority because smaller, more frequent segments mean recent data is always in a fresh segment. When the retention cleanup process runs, it can delete older segments immediately without waiting for a large segment to fill up. For high-priority topics, this means disk space is freed quickly and the cluster stays lean. For low-priority topics, larger and less frequent segments reduce the operational overhead of segment rolling and cleanup.
+### Good Routing Rules
 
-```
-Segment Rolling and Data Accessibility:
+Good routing rules are:
 
-High Priority Topic (segment.ms = 5 minutes):
-  Every 5 minutes, current segment closes and a new one opens
-  Closed segments can be immediately eligible for cleanup
-  Recent messages are in a small, efficiently accessible segment
+- easy to explain
+- easy to measure
+- stable over time
+- tied to actual business urgency
 
-  Time 0:00 -> Segment A opens
-  Time 0:05 -> Segment A closes (may have 1000 messages)
-               Segment B opens
-  Time 0:10 -> Segment B closes (may have 800 messages)
-               Segment C opens (current, being written to)
-  
-  Cleanup can delete Segment A as soon as it's older than retention.ms
+Example:
 
-Low Priority Topic (segment.ms = 1 hour):
-  Segment closes only once per hour
-  Less overhead, but cleanup can only happen on whole-segment boundaries
-```
-
-### Dimension 5: Consumer Configuration (Processing Commitment)
-
-The consumer configuration is arguably the most impactful dimension because it controls the actual processing resources dedicated to each tier. A high-priority topic with 6 partitions is wasted potential if the consumer group has only one instance with one thread.
-
-The full set of consumer differences for each tier includes the number of consumer instances (matching or approaching the partition count), the number of worker threads per instance for concurrent processing, the poll interval and processing timeout configurations, and the SLA targets that trigger alerts.
-
-```
-Complete Consumer Tier Configuration:
-
-HIGH PRIORITY CONSUMER GROUP:
-  Instances:         6 (one per partition, maximum parallelism)
-  Threads per inst:  10 (concurrent I/O-bound processing)
-  Total workers:     60
-  Poll timeout:      100ms (respond quickly to new messages)
-  Processing SLA:    < 500ms per message
-  Lag alert:         > 100 messages (tight, because retention is 1 day)
-  
-LOW PRIORITY CONSUMER GROUP:
-  Instances:         2 (limited, batch-friendly)
-  Threads per inst:  1 (sequential, simple, predictable)
-  Total workers:     2
-  Poll timeout:      5000ms (comfortable, no rush)
-  Processing SLA:    < 60 seconds per message
-  Lag alert:         > 10,000 messages (generous, retention is 7 days)
-```
-
-## The Complete Priority Architecture in Practice
-
-Bringing all five dimensions together, here is what a complete two-tier priority architecture looks like for a payment service:
-
-```
-PAYMENT SERVICE PRIORITY ARCHITECTURE
-======================================
-
-TIER 1: High Priority
----------------------
-Topic:              payment-service-high-priority-v1
-Partitions:         6
-Replication factor: 3 (with min.insync.replicas=2)
-Retention:          1 day (86,400,000 ms)
-Segment rolling:    5 minutes (300,000 ms)
-
-Consumer Group:     payment-high-processors
-Instances:          6 (auto-scaled, one per partition)
-Threads/instance:   10
-Strategy:           Concurrent (external payment gateway calls)
-SLA target:         500ms end-to-end
-Lag alert:          > 1,000 messages
-
-Use for: VIP transactions, fraud alerts, real-time balance checks
-
-
-TIER 2: Low Priority
----------------------
-Topic:              payment-service-low-priority-v1
-Partitions:         2
-Replication factor: 1 (lower cost, acceptable risk for batch)
-Retention:          7 days (604,800,000 ms)
-Segment rolling:    1 hour (3,600,000 ms)
-
-Consumer Group:     payment-low-processors
-Instances:          1 (single, batch-friendly)
-Threads/instance:   1
-Strategy:           Sequential (simple batch inserts to data warehouse)
-SLA target:         60 seconds per message
-Lag alert:          > 50,000 messages
-
-Use for: daily report generation, analytics export, audit archival
-
-
-PRODUCER ROUTING LOGIC:
-if transaction.amount > 10000 or customer.tier == "VIP":
+```text
+if event_type in {"fraud_alert", "payment_authorization"}:
     route to high-priority topic
 else:
-    route to low-priority topic
+    route to standard topic
 ```
 
-## The End-to-End Lifecycle of a High-Priority Message
+### Bad Routing Rules
 
-Following a single message through the entire system makes the architecture concrete. Consider a VIP customer placing a $50,000 order.
+Bad routing rules are:
 
-```
-Step 1: Producer identifies priority
+- vague
+- inconsistent
+- constantly changing
+- impossible to validate with metrics
 
-[Order Service]
-  order = {order_id: "VIP-001", amount: 50000, customer_tier: "VIP"}
-  router.send("payment-service", order, priority=HIGH)
-  
-  Internal routing: amount > 10000 -> high-priority topic
-  Key = customer_id (ensures all events for this customer are in same partition)
+Example:
 
-
-Step 2: Message lands in Kafka
-
-  Topic: payment-service-high-priority-v1
-  Partition 3 (determined by hash of customer_id)
-  
-  Broker 1 (Leader for Partition 3):  writes message, offset=10,047
-  Broker 2 (Follower):                replicates, offset=10,047
-  Broker 3 (Follower):                replicates, offset=10,047
-  
-  Producer receives ack only after BOTH followers confirm (min.insync.replicas=2)
-  Total time from produce() call to ack: ~15ms
-
-
-Step 3: Consumer receives message
-
-  Consumer instance C3 is assigned to Partition 3
-  C3's poll() returns the message at offset 10,047
-  C3 submits it to thread pool (Worker thread 7 picks it up)
-  
-  Worker 7: validates order -> calls payment gateway API -> receives approval
-  Total processing time: 180ms (200ms API call, some parallelism savings)
-
-
-Step 4: Offset committed
-
-  C3 commits offset 10,047 for Partition 3
-  SLA: message arrived in Kafka at T=0ms, fully processed at T=195ms
-  SLA target was 500ms — PASSED with 305ms to spare
-
-
-Step 5: Message lifecycle ends
-
-  Message persists in topic for 1 day
-  After 1 day, Kafka's cleanup thread deletes the segment containing offset 10,047
-  Disk space is freed
+```text
+if message_feels_important:
+    route to high-priority
 ```
 
-## Routing Logic: Where Business Logic Meets Infrastructure
+That kind of routing rule creates operational chaos.
 
-The routing producer is where business rules translate into infrastructure decisions. This is also where the most common mistakes happen. Two failure modes to watch for in production are **routing too many messages to high priority** and **routing too few**.
+### The Biggest Routing Failure Modes
 
-If your routing logic is too aggressive (everything goes to high priority), you defeat the purpose of the architecture. Your high-priority consumers become overloaded, consumer lag grows, SLAs are missed, and your low-priority infrastructure sits idle. The high-priority tier needs headroom — it should operate at well below capacity during normal conditions so it has reserve capacity to absorb spikes.
+#### Failure Mode 1: Too Many Records Go High Priority
 
-If your routing logic is too conservative (almost nothing qualifies as high priority), the high-priority infrastructure is wasteful and your users' most critical actions queue up behind batch work in the low-priority tier.
+If almost everything ends up in the high-priority lane:
 
-The right calibration comes from measuring your actual traffic. In most payment systems, VIP transactions and fraud alerts represent 5–15% of total volume but require 80% of processing resources. The routing threshold should be set to match this reality, and the partition count and consumer thread count should be sized accordingly.
+- the fast lane becomes the normal lane
+- high-priority consumers overload
+- lag rises
+- urgent work loses its protection
 
-## When to Add More Than Two Tiers
+#### Failure Mode 2: Too Few Records Go High Priority
 
-Two tiers (high and low) are sufficient for most systems. A third tier makes sense when you have three genuinely distinct service level requirements with no practical way to handle all three with two tiers. For example: real-time fraud detection (< 100ms), standard payment processing (< 2 seconds), and batch reconciliation (< 24 hours). These have different enough requirements that a single "high" tier cannot serve both the 100ms and the 2-second use case well without over-provisioning.
+If almost nothing qualifies:
 
-The cost of each additional tier is operational complexity: more topics to monitor, more consumer groups to track, more routing rules to maintain, and more alerting configurations to manage. Practical experience in the industry suggests that most production systems need at most three tiers, and many work well with two. If you find yourself designing five or more priority tiers, that is a signal that the routing logic has become the system's main complexity, and you should consider whether a different architectural approach (like a dedicated job scheduler for batch work) would serve you better.
+- expensive high-priority capacity sits mostly idle
+- urgent records may still get routed too late or inconsistently
+
+### Intuition
+
+Routing answers:
+
+**"What deserves special treatment badly enough that I am willing to isolate capacity for it?"**
+
+## 2. Partition Count: How Much Scale Does Each Lane Need?
+
+Partition count is the throughput and concurrency ceiling for each topic.
+
+From Chapter 2:
+
+- more partitions = more parallelism
+- fewer partitions = lower parallelism, simpler behavior
+
+This matters a lot in a priority architecture.
+
+### High-Priority Topics
+
+High-priority lanes often need:
+
+- enough partitions to scale out consumers aggressively
+- enough headroom for traffic spikes
+- low queueing delay
+
+### Low-Priority Topics
+
+Low-priority lanes often need:
+
+- fewer partitions
+- simpler operations
+- lower infrastructure cost
+- enough throughput to eventually clear work, not necessarily instantly
+
+### Example
+
+```text
+high-priority topic:
+12 partitions
+can actively use up to 12 consumers in one group
+
+low-priority topic:
+3 partitions
+can actively use up to 3 consumers in one group
+```
+
+This is a real priority distinction because the high-priority lane can absorb more parallel consumer capacity.
+
+### Intuition
+
+Partition count answers:
+
+**"How much parallel work capacity am I reserving for this lane?"**
+
+## 3. Consumer Allocation: Who Actually Gets the Compute?
+
+This is where many teams accidentally fake priority.
+
+They create two topics:
+
+- `payments-high`
+- `payments-low`
+
+but both are still read by the same underpowered consumer design.
+
+That is not real priority isolation.
+
+Priority becomes real when the consumer side is intentionally different.
+
+### High-Priority Consumers Often Have
+
+- more instances
+- more worker threads if work is I/O-bound
+- tighter alerting
+- stricter latency SLOs
+- stronger on-call visibility
+
+### Low-Priority Consumers Often Have
+
+- fewer instances
+- lower concurrency
+- more relaxed lag tolerance
+- more batch-oriented behavior
+
+### Example
+
+```text
+high-priority lane:
+6 consumer instances
+8 worker threads each
+aggressive autoscaling
+strict lag alerts
+
+low-priority lane:
+2 consumer instances
+1 worker thread each
+batch-oriented processing
+relaxed lag alerts
+```
+
+Now the system actually behaves differently under load.
+
+### Intuition
+
+Consumer allocation answers:
+
+**"When the system is busy, who gets the workers?"**
+
+## 4. Durability Configuration: Which Lane Gets Stronger Safety Guarantees?
+
+Sometimes high-priority also means high-importance.
+
+That may require stronger producer and topic durability.
+
+Examples:
+
+- `acks=all`
+- `enable.idempotence=true`
+- `replication.factor=3`
+- `min.insync.replicas=2`
+
+Low-priority topics may tolerate:
+
+- weaker replication
+- cheaper storage posture
+- more relaxed failure semantics
+
+But this must be decided carefully.
+
+### Important Distinction
+
+High-priority does not always mean high-durability.
+
+Some workloads are:
+
+- urgent but disposable
+
+Example:
+
+- real-time live dashboard updates
+
+Other workloads are:
+
+- urgent and critical
+
+Example:
+
+- fraud alerts
+- payment authorization events
+
+So do not assume "priority" always maps directly to "maximum durability."
+
+You must ask two separate questions:
+
+- how fast must this be?
+- how safe must this be?
+
+### Intuition
+
+Durability settings answer:
+
+**"If this lane fails, how much loss am I willing to accept?"**
+
+## 5. Retention and Replay Window: How Long Must Each Lane Stay Recoverable?
+
+Priority lanes often differ in how much replay history matters.
+
+### High-Priority Topics
+
+High-priority topics often contain records that are operationally urgent right now.
+
+Sometimes that means:
+
+- shorter retention is acceptable
+- replay need is limited
+- low disk footprint matters
+
+### Low-Priority Topics
+
+Low-priority topics often feed:
+
+- analytics
+- batch processing
+- delayed consumers
+- backfills
+- new service bootstrap
+
+That often means:
+
+- longer retention is useful
+
+### Example
+
+```text
+high-priority topic:
+retention.ms = 1 day
+
+low-priority topic:
+retention.ms = 7 days
+```
+
+This gives:
+
+- tighter operational footprint for urgent records
+- larger replay window for slower consumers and backfills
+
+### Important Caveat
+
+Short retention on a high-priority topic means lag becomes dangerous faster.
+
+If the high-priority consumer is down for longer than the retention window:
+
+- the urgent data may be gone before recovery
+
+So shorter retention is only safe if:
+
+- monitoring is strong
+- lag alerts are tight
+- recovery expectations are realistic
+
+### Intuition
+
+Retention answers:
+
+**"How long should this lane remain recoverable from Kafka alone?"**
+
+## What a Real Two-Tier Architecture Looks Like
+
+Here is a practical example for a payment system.
+
+## Tier 1: High-Priority
+
+Use for:
+
+- fraud alerts
+- payment authorization
+- VIP transactions
+- real-time balance-affecting events
+
+Typical design:
+
+```text
+topic: payments-high
+partitions: 12
+replication.factor: 3
+min.insync.replicas: 2
+retention: 1 day
+
+producer:
+acks=all
+enable.idempotence=true
+
+consumer:
+many instances
+concurrent processing if I/O-bound
+tight lag alerting
+tight processing SLOs
+```
+
+## Tier 2: Standard / Low-Priority
+
+Use for:
+
+- analytics export
+- reporting
+- non-urgent notification pipelines
+- delayed enrichment jobs
+
+Typical design:
+
+```text
+topic: payments-standard
+partitions: 3
+replication.factor: 2 or 3 depending value
+retention: 7 days
+
+producer:
+safe or throughput-oriented depending business value
+
+consumer:
+fewer instances
+possibly sequential or lower-concurrency
+more relaxed lag thresholds
+```
+
+The point is not that every system must use exactly these numbers.
+
+The point is that the high-priority lane must have meaningfully different resources and expectations.
+
+## What Priority Architecture Looks Like End to End
+
+```text
+incoming business event
+        |
+        v
+producer routing logic decides lane
+        |
+        +--> high-priority topic
+        |       |
+        |       +--> stronger producer guarantees
+        |       +--> more partitions
+        |       +--> more consumer capacity
+        |       +--> tighter lag/SLA alerts
+        |
+        +--> standard topic
+                |
+                +--> lower-cost processing path
+                +--> fewer partitions
+                +--> fewer consumers
+                +--> longer acceptable lag
+```
+
+That is how Kafka priority becomes real.
+
+## The Questions You Must Answer Before Creating Priority Tiers
+
+Before implementing a tiered architecture, answer these clearly.
+
+### 1. What exactly qualifies for the fast lane?
+
+If this is fuzzy, stop and define it before building anything.
+
+### 2. How much traffic will the fast lane actually carry?
+
+If high-priority is 80% of all traffic, it is not really a fast lane anymore.
+
+### 3. What latency or SLO does each lane need?
+
+You need actual numbers:
+
+- under 200ms
+- under 2 seconds
+- under 1 minute
+
+Not vague statements like "pretty fast."
+
+### 4. What consumer capacity does each lane need at peak?
+
+This decides partitions and worker allocation.
+
+### 5. What durability does each lane require?
+
+Fast and durable are separate dimensions.
+
+### 6. How much replay window does each lane need?
+
+This decides retention strategy.
+
+### 7. How will you know if the fast lane is being polluted by low-value traffic?
+
+You need observable routing metrics.
+
+## How to Know If the Priority Architecture Is Actually Working
+
+A priority architecture should be observable.
+
+Otherwise you cannot tell whether the fast lane is real or imaginary.
+
+You should monitor at least:
+
+- volume per lane
+- lag per lane
+- lag per partition within the high-priority lane
+- processing latency per lane
+- routing percentages
+- high-priority consumer saturation
+- DLQ growth by lane
+
+### Healthy Signals
+
+Signs the architecture is working:
+
+- high-priority lag stays low under normal load
+- high-priority SLA is consistently met
+- low-priority lag can grow without harming urgent work
+- high-priority traffic percentage stays in the expected range
+
+### Broken Signals
+
+Signs the architecture is not working:
+
+- high-priority lag spikes whenever normal traffic grows
+- most traffic ends up in the high-priority lane
+- consumers for both lanes are equally overloaded
+- routing logic is hard to explain
+- on-call cannot tell which lane is failing
+
+## The Most Common Priority Architecture Mistakes
+
+## Mistake 1: Same Topic, Same Consumers, Different Labels
+
+This is fake priority.
+
+If the records still share the same partitions and consumers, urgent work is not isolated.
+
+## Mistake 2: Everything Becomes High Priority
+
+This collapses the architecture.
+
+The fast lane must remain scarce enough to stay fast.
+
+## Mistake 3: Durability and Latency Get Mixed Up
+
+Urgent does not always mean critical.
+Critical does not always mean ultra-low-latency.
+
+Keep those dimensions separate.
+
+## Mistake 4: Too Many Tiers
+
+If you have:
+
+- ultra-high
+- high
+- medium-high
+- medium
+- medium-low
+- low
+
+you probably built a taxonomy problem, not a Kafka solution.
+
+Most systems need:
+
+- one lane, or
+- two lanes, or
+- at most three meaningful lanes
+
+## Mistake 5: No Validation of Routing Logic
+
+If you cannot answer:
+
+- what percentage of traffic is routed high priority?
+- which event types dominate the high-priority lane?
+- when did that distribution change?
+
+then the architecture is under-observed.
+
+## When Two Tiers Are Enough
+
+Two tiers are enough for most systems:
+
+- urgent
+- not urgent
+
+This is especially true when the business distinction is clear:
+
+- real-time operational events
+- everything else
+
+## When Three Tiers Make Sense
+
+A third tier can make sense when you truly have three distinct service levels.
+
+Example:
+
+- real-time fraud detection: under 100ms
+- normal payment processing: under 2 seconds
+- batch reconciliation: under 24 hours
+
+Those are genuinely different lanes.
+
+But add a third tier only when the operational difference is real and measurable.
+
+## When Kafka Priority Is the Wrong Tool
+
+Sometimes the right answer is not more Kafka tiers.
+
+If the real problem is:
+
+- scheduled batch orchestration
+- workflow dependencies
+- long-running jobs
+- cron-like timing
+
+then a job scheduler or workflow system may be a better fit than trying to encode everything as Kafka priority lanes.
+
+Kafka is best when the core problem is:
+
+**different event streams need different throughput, latency, and isolation characteristics**
+
+## The Priority Design Framework
+
+If you are unsure whether to build priority lanes, use this checklist.
+
+### Create separate priority lanes when:
+
+- urgent work must be protected from background work
+- SLOs differ materially
+- consumer resources must be isolated
+- routing rules are explainable and measurable
+
+### Keep one lane when:
+
+- urgency is mostly the same across events
+- one consumer architecture can satisfy all needs
+- operational simplicity matters more than micro-optimization
+
+### Add a third lane only when:
+
+- the second lane is not enough to represent real SLO differences
+- on-call can still reason about the system clearly
+
+## The Intuition to Carry Forward
+
+If you remember only a few lines from this chapter, remember these:
+
+- Kafka does not do in-partition priority scheduling for you
+- priority is created by separating workloads and giving them different resources
+- routing is the heart of the architecture
+- partitions and consumers decide who gets throughput
+- durability and latency are separate decisions
+- retention decides how recoverable each lane is
+- if high-priority traffic is not isolated, it is not really high priority
+
+With that foundation in place, the next step is to make each consumer lane resilient when the real world gets messy:
+
+- downstream slowdowns
+- retry storms
+- poison messages
+- rate limits
+- overload
 
 ---
 
-**What comes next:** Chapter 6 covers the enterprise resilience patterns that protect your Kafka consumers from the inevitable failures of distributed systems: Rate Limiting, Backpressure, Bulkhead Isolation, Circuit Breaking, Message Filtering, and Dead Letter Queues. Each pattern addresses a specific failure mode, and understanding which failure mode each addresses is the key to knowing when to apply it.
+**What comes next:** Chapter 6 covers resilience patterns and explains when to apply rate limiting, backpressure, bulkheads, circuit breakers, filtering, and dead letter queues so your Kafka consumers stay stable under production failures.
