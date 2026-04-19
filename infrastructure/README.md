@@ -1,137 +1,282 @@
-# Self-Managed Kafka Infrastructure (Local + VM)
+# Kafka Infrastructure
 
-This folder gives you an enterprise-style baseline for running Kafka without a managed service.
+This folder contains the local or single-VM Kafka infrastructure for this project.
 
-## Why Docker Compose (Production Decision for Your Current Stage)
+It is intentionally simple:
 
-For your current setup (local machine now, VM later), `docker-compose.yml` is the best fit because:
+- 1 Kafka broker running in KRaft mode
+- 1 Kafka UI instance for inspection
+- 1 Python lifecycle script for repeatable operations
+- 1 smoke test for proving real producer and consumer flow
 
-1. It models multi-service infrastructure (Kafka broker + UI) in one declarative file.
-2. It is portable from local laptop to a single cloud VM with minimal changes.
-3. It supports deterministic startup, health checks, and controlled teardown.
+This is a good learning and development setup. It is not a full production Kafka platform yet.
 
-A single `Dockerfile` would only package one service and is not ideal for orchestration.
+## What Is In This Folder
 
-## Infrastructure-Level Dependencies
+- `docker-compose.yml`
+  Defines the Kafka broker, Kafka UI, ports, health checks, volumes, and Docker network.
+- `.env.example`
+  Holds the default environment values for host, ports, partitions, and JVM sizing.
+- `scripts/kafka_infrastructure.py`
+  The main operational entry point for starting, stopping, checking, and inspecting the stack.
+- `smoke_tests/kafka_smoke_test.py`
+  An isolated end-to-end smoke test that produces and consumes a real Kafka record.
 
-## Stage 1 - Host Dependencies
-1. Docker Engine or Docker Desktop (Linux/Windows/macOS).
-2. Docker Compose plugin (`docker compose version` must work).
-3. Minimum recommended VM sizing:
-1. CPU: 2 vCPU (4 vCPU preferred).
-2. RAM: 4 GB minimum (8 GB preferred).
-3. Disk: 20+ GB SSD.
+## Listener Model
 
-## Stage 2 - Network Dependencies
-1. Open inbound port `9094` for Kafka client traffic (if remote clients connect).
-2. Open inbound port `8080` for Kafka UI (optional, restrict by firewall).
-3. Ensure DNS/IP used in `.env` (`KAFKA_EXTERNAL_HOST`) is reachable by clients.
+This setup uses two different listener contexts:
 
-## Stage 3 - Security Dependencies (Production Hardening Path)
-1. TLS for Kafka listeners.
-2. SASL authentication (SCRAM or mTLS strategy).
-3. Restricted network access (private subnets, security groups/firewall rules).
-4. Secrets management (do not keep credentials in plaintext `.env`).
+- `kafka:9092`
+  Internal Docker network listener. Containers use this.
+- `<host>:9094`
+  External listener exposed to your machine or VM clients. Applications outside Docker use this.
 
-Current compose is PLAINTEXT to keep onboarding simple; hardening is the next step before true production use.
+For local development, the external bootstrap server is usually:
 
-## Files in This Folder
-
-1. `D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\docker-compose.yml`
-2. `D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\.env.example`
-3. `D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py`
-
-## Lifecycle Stages (Operational Runbook)
-
-## Stage 0 - Bootstrap Configuration
-1. Copy env template:
-
-```powershell
-Copy-Item "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\.env.example" "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\.env"
+```text
+localhost:9094
 ```
 
-2. Update `KAFKA_EXTERNAL_HOST`:
-1. Local machine: `localhost`
-2. VM: VM private/public IP or DNS name used by your applications
+Kafka UI is exposed at:
 
-## Stage 1 - Bring Infrastructure Up
-
-```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" up
+```text
+http://localhost:8080
 ```
 
-## Stage 2 - Validate Runtime
+## Quick Start
+
+Run these commands from the `infrastructure/` directory.
+
+### 1. Create `.env`
 
 ```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" status
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" health
+Copy-Item .env.example .env
 ```
 
-Kafka UI URL: [http://localhost:8080](http://localhost:8080)
+If `.env` already exists, keep it and only update values when you intentionally want to change them.
 
-## Stage 3 - Observe Logs
+### 2. Set the external host
+
+Open `.env` and set:
+
+- `KAFKA_EXTERNAL_HOST=localhost` for local development
+- `KAFKA_EXTERNAL_HOST=<vm-ip-or-dns>` for a VM that external clients will reach
+
+### 3. Start the stack
 
 ```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" logs --service kafka --lines 200
+python scripts/kafka_infrastructure.py up
 ```
 
-## Stage 4 - Controlled Restart
+The script will:
+
+- create `.env` from `.env.example` if needed
+- validate Docker and `docker compose`
+- validate the compose configuration
+- start Kafka and Kafka UI
+
+### 4. Check status
 
 ```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" restart
+python scripts/kafka_infrastructure.py status
+python scripts/kafka_infrastructure.py health
 ```
 
-## Stage 5 - Controlled Shutdown
+Expected outcome:
 
-```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" down
-```
+- `status` shows the containers running
+- `health` prints `healthy`
 
-Full reset (destructive, removes Kafka data volumes):
+### 5. Open Kafka UI
 
-```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\scripts\kafka_infrastructure.py" down --remove-volumes
-```
+[Kafka UI](http://localhost:8080)
 
-## How Your Python Apps Should Connect
+## How Applications Should Connect
 
-From your host machine, use:
+### From your host machine
+
+Use:
 
 ```python
 bootstrap_servers = "localhost:9094"
 ```
 
-From another machine in network/VM setup, use:
+### From another machine talking to a VM
+
+Use:
 
 ```python
 bootstrap_servers = "<KAFKA_EXTERNAL_HOST>:9094"
 ```
 
-## Notes for Cloud VM Migration
+### From another container on the same Docker network
 
-1. Keep this same folder and move it to your VM.
-2. Install Docker + Compose on VM.
-3. Set `KAFKA_EXTERNAL_HOST` to VM IP/DNS.
-4. Open firewall/security-group ports (`9094`, optional `8080`).
-5. Run the same Python lifecycle script commands.
+Use:
 
-## Infrastructure Smoke Test (Isolated)
-
-Use the isolated smoke test folder to validate real infra messaging flow:
-
-1. `D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\smoke_tests\README.md`
-2. `D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\smoke_tests\kafka_smoke_test.py`
-
-Run:
-
-```powershell
-python "D:\Generative AI Portfolio Projects\kafka_version_3\infrastructure\smoke_tests\kafka_smoke_test.py" --bootstrap-servers "localhost:19094"
+```python
+bootstrap_servers = "kafka:9092"
 ```
 
-## Next Enterprise Upgrades (Recommended)
+## Operational Commands
 
-1. 3-broker KRaft cluster with dedicated controllers.
-2. TLS + SASL auth for all external listeners.
-3. Metrics stack (Prometheus + Grafana) and alerting.
-4. Schema Registry + ACL policy management.
-5. Backup/restore plan for Kafka volumes and configs.
+### Show status
+
+```powershell
+python scripts/kafka_infrastructure.py status
+```
+
+### Run health check
+
+```powershell
+python scripts/kafka_infrastructure.py health
+```
+
+### View logs
+
+Kafka broker logs:
+
+```powershell
+python scripts/kafka_infrastructure.py logs --service kafka --lines 200
+```
+
+Kafka UI logs:
+
+```powershell
+python scripts/kafka_infrastructure.py logs --service kafka-ui --lines 200
+```
+
+### Restart the stack
+
+```powershell
+python scripts/kafka_infrastructure.py restart
+```
+
+### Stop the stack
+
+```powershell
+python scripts/kafka_infrastructure.py down
+```
+
+### Full reset
+
+This removes Kafka data volumes and is destructive:
+
+```powershell
+python scripts/kafka_infrastructure.py down --remove-volumes
+```
+
+Use this only when you intentionally want to wipe broker state and start fresh.
+
+## Smoke Test
+
+The smoke test is the fastest way to prove the infrastructure is actually usable, not just running.
+
+It validates:
+
+- connection to Kafka
+- produce success
+- consume success
+
+### Install smoke test dependency
+
+```powershell
+python -m pip install -r smoke_tests/requirements.txt
+```
+
+### Run the smoke test
+
+```powershell
+python smoke_tests/kafka_smoke_test.py --bootstrap-servers localhost:9094
+```
+
+Expected success output includes:
+
+```text
+SMOKE TEST RESULT: PASS
+```
+
+If it fails, the script prints the reason directly so you can debug from there.
+
+## Configuration You Should Actually Care About
+
+The most important values in `.env` for this setup are:
+
+- `KAFKA_EXTERNAL_HOST`
+  What clients outside Docker should use to reach Kafka.
+- `KAFKA_EXTERNAL_PORT`
+  The host port exposed for Kafka clients. Default is `9094`.
+- `KAFKA_UI_PORT`
+  The host port exposed for Kafka UI. Default is `8080`.
+- `KAFKA_DEFAULT_PARTITIONS`
+  Default partition count for auto-created topics if auto-create is enabled.
+- `KAFKA_AUTO_CREATE_TOPICS`
+  Whether Kafka may auto-create topics. Default is `false`, which is a safer production habit.
+- `KAFKA_JVM_XMS` and `KAFKA_JVM_XMX`
+  Heap sizing for the broker.
+- `KAFKA_KRAFT_CLUSTER_ID`
+  Keep this stable once the broker has data.
+
+## Common Issues
+
+### `health` fails even though containers exist
+
+Usually means Kafka has started at the container level but is not yet ready at the broker API level. Wait a little longer, then run:
+
+```powershell
+python scripts/kafka_infrastructure.py health
+```
+
+### App cannot connect from host
+
+Check:
+
+- are you using `localhost:9094` rather than `kafka:9092`
+- is the Kafka container healthy
+- is `KAFKA_EXTERNAL_HOST` correct in `.env`
+
+### App cannot connect from another machine
+
+Check:
+
+- `KAFKA_EXTERNAL_HOST` is set to a reachable VM IP or DNS name
+- port `9094` is open in firewall or security-group rules
+- the client is not trying to use `localhost`
+
+### Kafka UI opens but no cluster data appears
+
+Kafka UI depends on the broker health check. If Kafka is not healthy yet, UI may load before useful cluster data is available. Recheck broker health first.
+
+### Smoke test fails
+
+Check in this order:
+
+1. `python scripts/kafka_infrastructure.py status`
+2. `python scripts/kafka_infrastructure.py health`
+3. `python scripts/kafka_infrastructure.py logs --service kafka --lines 200`
+4. rerun `python smoke_tests/kafka_smoke_test.py --bootstrap-servers localhost:9094`
+
+## Production Hardening Path
+
+This setup is intentionally plaintext and single-broker to keep learning and onboarding straightforward.
+
+Before calling it real production infrastructure, you should plan for:
+
+1. multi-broker Kafka cluster
+2. stronger replication and ISR policies
+3. TLS for listeners
+4. SASL or mTLS authentication
+5. restricted network access
+6. metrics, dashboards, and alerts
+7. backup and recovery plan
+8. schema governance and topic management policy
+
+## When This Setup Is The Right Fit
+
+Use this setup when:
+
+- you are learning Kafka
+- you want a reproducible local development stack
+- you want a single-VM demo or portfolio deployment
+- you want to validate producer and consumer behavior against a real broker
+
+Do not mistake it for a complete enterprise Kafka platform. It is the right foundation for this project stage, not the final shape of a large production deployment.

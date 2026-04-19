@@ -134,8 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run isolated Kafka smoke test against real infrastructure.")
     parser.add_argument(
         "--bootstrap-servers",
-        default="localhost:19094",
-        help="Kafka bootstrap servers, e.g. localhost:19094",
+        default="localhost:9094",
+        help="Kafka bootstrap servers, e.g. localhost:9094",
     )
     parser.add_argument(
         "--topic-prefix",
