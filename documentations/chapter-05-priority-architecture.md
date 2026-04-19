@@ -736,4 +736,4 @@ With that foundation in place, the next step is to make each consumer lane resil
 
 ---
 
-**What comes next:** Chapter 6 covers resilience patterns and explains when to apply rate limiting, backpressure, bulkheads, circuit breakers, filtering, and dead letter queues so your Kafka consumers stay stable under production failures.
+**What comes next:** Chapter 6 covers resilience patterns and explains when to apply rate limiting, backpressure, bulkheads, circuit breakers, filtering, and dead letter queues so your Kafka consumers stay stable under production failures. That is the chapter that turns these priority lanes into something that stays healthy under real production stress instead of only looking good on paper.

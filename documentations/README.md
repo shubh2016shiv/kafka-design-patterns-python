@@ -2,7 +2,7 @@
 
 This directory contains a structured series of documents covering the foundational concepts, architectural patterns, and production considerations for Apache Kafka. The materials are designed to provide a systematic understanding of Kafka's capabilities and implementation strategies.
 
-## Contents
+## Learn In Order
 
 *   **[Chapter 1: What is Kafka?](./chapter-01-what-is-kafka.md)**
     An introduction to Apache Kafka, its primary use cases, and its role in modern distributed systems.
@@ -25,6 +25,19 @@ This directory contains a structured series of documents covering the foundation
 *   **[Chapter 7: Production Decisions](./chapter-07-production-decisions.md)**
     Key considerations, best practices, and operational guidelines for deploying and managing Kafka in production environments.
 
+## Quick Reference
+
+*   **[Appendix: Kafka Configurations You Must Know in Production](./appendix-kafka-production-configurations.md)**
+    A decision-oriented reference for producer, consumer, topic, and broker configurations, including safe defaults, trade-offs, and scenario-based combinations.
+
+*   **[Kafka Quick Reference Cheatsheet](./kafka-quick-reference-cheatsheet.md)**
+    A compact visual reference for partitions, offsets, consumer groups, retention, event structure, and the most important producer and consumer knobs.
+
 ## Usage
 
-These chapters are arranged sequentially to build understanding progressively, but each document can also serve as a standalone reference for its specific topic.
+Use this folder in two modes:
+
+- **Learn in order** if you want to build intuition from first principles through production operations.
+- **Quick reference** if you already know the basics and need a fast reminder of key mechanics, configs, or failure signals.
+
+The chapters are arranged sequentially to build understanding progressively, while the appendix and cheatsheet are optimized for fast lookup later.

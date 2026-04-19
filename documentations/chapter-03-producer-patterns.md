@@ -25,7 +25,7 @@ This chapter is written to make those decisions intuitive.
 
 ## What a Producer Actually Does
 
-Let us walk through what really happens when your code "sends a message."
+Let us walk through what really happens when your code sends a Kafka **record**. In this chapter, "message" may still appear informally, but **record** is the more precise term.
 
 ### Step 1: Build the Event
 
@@ -903,4 +903,4 @@ Once this is clear, the consumer side becomes the natural next question:
 
 ---
 
-**What comes next:** Chapter 4 covers consumer patterns and the consumer-side configuration decisions that matter most in production: commit timing, auto-commit vs manual commit, sequential vs concurrent processing, and how to choose safety, throughput, and resilience trade-offs on the read path.
+**What comes next:** Chapter 4 covers consumer patterns and the consumer-side configuration decisions that matter most in production: commit timing, auto-commit vs manual commit, sequential vs concurrent processing, and how to choose safety, throughput, and resilience trade-offs on the read path. Chapters 3 and 4 together form the main config foundation, and Chapter 7 ties both sides together into one production decision framework.

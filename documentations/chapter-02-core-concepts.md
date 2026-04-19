@@ -590,6 +590,13 @@ A Kafka event is usually called a **record**, and in practice it often has these
 - timestamp
 - optional headers
 
+Throughout the rest of this series:
+
+- **record** is used when precision matters
+- **message** is sometimes used informally in the conversational sense
+
+The two usually refer to the same Kafka item, but **record** is the more precise term.
+
 Here is a realistic example:
 
 ```json
@@ -1164,4 +1171,4 @@ That is where production configuration starts to matter.
 
 ---
 
-**What comes next:** Chapter 3 moves to the producer side and explains what a producer is really doing under the hood, which configurations matter most in production, and how to choose the right producer pattern instead of copying random defaults.
+**What comes next:** Chapter 3 moves to the producer side and explains what a producer is really doing under the hood, which configurations matter most in production, and how to choose the right producer pattern instead of copying random defaults. After you finish Chapters 3 and 4, use the appendix and cheatsheet in this folder as the fast lookup layer for the configs introduced there.

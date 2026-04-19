@@ -924,4 +924,4 @@ Once this is clear, the next architectural step is easier to reason about:
 
 ---
 
-**What comes next:** Chapter 5 covers priority architecture and shows how to translate different business service levels into Kafka topic design, routing strategy, and consumer allocation decisions.
+**What comes next:** Chapter 5 covers priority architecture and shows how to translate different business service levels into Kafka topic design, routing strategy, and consumer allocation decisions. When you need to connect the consumer choices in this chapter back to sizing, monitoring, and incident handling, Chapter 7 is the synthesis chapter to use.
