@@ -38,12 +38,15 @@ Comments/docstrings must explain:
 - what inputs are expected
 - what outputs/contracts are produced
 - production tradeoffs and failure behavior
+- Every non-trivial class and function must include a detailed docstring covering purpose, inputs, outputs, and failure behavior.
+- Small helper functions should still include a concise one-line docstring.
 
 Avoid comments that only restate syntax.
 
 ## 3. Explain Imports, Config, and Models
 
 ### Imports
+- Explain every import block with short comments/docstrings so readers know why each dependency exists in that module.
 - Explain non-obvious imports and optional dependencies.
 - If fallback imports exist, document:
 - why fallback is needed
@@ -51,15 +54,25 @@ Avoid comments that only restate syntax.
 - failure mode when neither dependency is available
 
 ### Configuration
-- For each important config/default constant, explain:
+- For each important config/default constant, explain in nearby comments/docstrings:
 - what it controls
 - why this value is the default
 - when/why to tune it for production
+- Include safe/expected ranges or allowed values when applicable.
 
 ### Pydantic Models (when used)
-- Explain why the model exists (validation boundary, schema contract, serialization contract).
-- Explain key fields, required/optional behavior, and defaults.
+- Explain every model in a class docstring: why it exists (validation boundary, schema contract, serialization contract).
+- Explain key fields, required/optional behavior, and defaults, including default rationale.
 - Explain validators and compatibility/versioning assumptions.
+- Prefer explicit `Field(...)` metadata (descriptions/constraints) for externally meaningful fields.
+
+### Naming, Typing, and Enum Standards
+- Use intuitive, professional, descriptive names for variables, classes, functions, and modules. Names should be easy to understand quickly without guessing.
+- Avoid cryptic abbreviations; use domain-accurate terminology consistently.
+- Require explicit type hints for function parameters, return values, and meaningful class attributes.
+- Use `Enum` for finite known states/options instead of magic strings/integers.
+- Follow typing-library best practices: use precise types (`Literal`, `TypedDict`, `Protocol`, generics, aliases) where they improve contract clarity.
+- Avoid `Any` unless unavoidable; if used, document why and the boundary where strict typing resumes.
 
 ## 4. Simplicity and Scope Control
 
