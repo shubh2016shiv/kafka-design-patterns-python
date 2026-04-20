@@ -8,16 +8,11 @@ dependencies = [
     # Primary Kafka clients used across producer and consumer patterns.
     "confluent-kafka>=2.6.0",
     "kafka-python>=2.0.2",
-    # Operational metrics in infrastructure/health scripts.
-    "psutil>=5.9.0",
-]
-
-[project.optional-dependencies]
-# Battle-tested resilience stack for future migration from bespoke logic.
-resilience = [
+    # Battle-tested resilience libraries used by the DLQ producer.
     "pybreaker>=1.4.0",
     "tenacity>=9.0.0",
-    "prometheus-client>=0.20.0",
+    # Operational metrics in infrastructure/health scripts.
+    "psutil>=5.9.0",
 ]
 
 [tool.ruff]
@@ -34,7 +29,7 @@ ignore = ["E501"]
 "consumers/**/*.py" = ["E402", "E722", "F401", "F541", "F841"]
 "test/consumer/**/*.py" = ["E402", "F401", "F541", "F841"]
 "producers/resilient/*.py" = ["F401", "F841"]
-"producers/topic_routing/*.py" = ["F401"]
+"producers/content_based_router/*.py" = ["F401"]
 "producers/simple_producer.py" = ["E402"]
 
 [tool.ruff.format]
