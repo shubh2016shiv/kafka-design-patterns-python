@@ -17,9 +17,10 @@ ENV/
 env.bak/
 venv.bak/
 
-# IDE / Editor
+# IDE / Editor / AI Agents
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
@@ -40,7 +41,8 @@ htmlcov/
 ehthumbs.db
 Thumbs.db
 
-# Project specific (Kafka/Infrastructure)
-# If you have local kafka data directories, add them below:
-# /infrastructure/data/
-# /infrastructure/logs/
+# Build and Distribution
+build/
+dist/
+*.egg-info/
+*.egg
