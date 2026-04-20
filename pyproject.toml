@@ -1,0 +1,20 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Phase 1: maintain strict checks where the codebase is actively maintained.
+# Legacy-heavy paths can be tightened incrementally in follow-up cleanup PRs.
+"consumers/**/*.py" = ["E402", "E722", "F401", "F541", "F841"]
+"test/consumer/**/*.py" = ["E402", "F401", "F541", "F841"]
+"producers/resilient/*.py" = ["F401", "F841"]
+"producers/topic_routing/*.py" = ["F401"]
+"producers/simple_producer.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

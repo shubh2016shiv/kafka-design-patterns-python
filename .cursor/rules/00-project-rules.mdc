@@ -1,0 +1,15 @@
+---
+description: Core project rules for Cursor agents
+alwaysApply: true
+---
+
+Follow the repository canonical agent instructions in [AGENTS.md](../../AGENTS.md).
+
+Required emphasis:
+- educational + professional code quality
+- modular and SOLID design
+- stage/sub-stage code flow markers (`Stage X.Y`)
+- ASCII flow diagram for non-trivial modules
+- explain imports, configuration constants, and Pydantic models
+- keep changes surgical and test-backed
+- run mandatory quality gate commands from `AGENTS.md` before commit/PR
