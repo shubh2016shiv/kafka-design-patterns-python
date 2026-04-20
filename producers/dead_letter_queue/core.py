@@ -721,10 +721,19 @@ class DeadLetterQueueProducer:
         for attempt in range(self.config.max_retries + 1):
             # Stage 3.1 — Attempt the send via routing or direct topic.
             try:
+                # Stage 3.1.1:
+                # Force broker confirmation for each send attempt so success means
+                # broker-acknowledged delivery, not just local queueing.
+                send_kwargs = dict(kwargs)
+                send_kwargs["require_delivery_confirmation"] = True
+                send_kwargs["delivery_timeout_seconds"] = (
+                    self.config.delivery_confirmation_timeout_seconds
+                )
+
                 if routing_metadata is not None:
-                    self._routing_producer.send_with_metadata(data, routing_metadata, **kwargs)
+                    self._routing_producer.send_with_metadata(data, routing_metadata, **send_kwargs)
                 else:
-                    self._routing_producer.send_to_topic(topic, data, **kwargs)
+                    self._routing_producer.send_to_topic(topic, data, **send_kwargs)
 
                 # Stage 3.2 — Success: return without exhausting remaining retries.
                 return SendAttemptResult(
@@ -819,7 +828,12 @@ class DeadLetterQueueProducer:
         }
 
         try:
-            self._underlying_producer.send(self._dlq_topic, dlq_envelope)
+            self._underlying_producer.send(
+                self._dlq_topic,
+                dlq_envelope,
+                require_delivery_confirmation=True,
+                delivery_timeout_seconds=self.config.delivery_confirmation_timeout_seconds,
+            )
             logger.info(
                 "DLQ preserved — service=%s, dlq_topic=%s, original_topic=%s",
                 self.service_name,

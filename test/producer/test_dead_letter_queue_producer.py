@@ -105,6 +105,55 @@ class DeadLetterQueueProducerTests(unittest.TestCase):
             self.assertEqual(kwargs["environment"], Environment.STAGING)
             self.assertEqual(kwargs["bootstrap_servers"], "localhost:19094")
 
+    def test_send_with_fault_tolerance_forces_delivery_confirmation_on_primary_send(self):
+        """Success path must require broker-confirmed delivery before returning success."""
+        underlying = Mock()
+        routing = Mock()
+        config = FaultToleranceConfig(max_retries=0, delivery_confirmation_timeout_seconds=7.5)
+
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+        result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-1001"},
+        )
+
+        self.assertTrue(result.success)
+        routing.send_to_topic.assert_called_once()
+        send_kwargs = routing.send_to_topic.call_args.kwargs
+        self.assertTrue(send_kwargs["require_delivery_confirmation"])
+        self.assertEqual(send_kwargs["delivery_timeout_seconds"], 7.5)
+        underlying.send.assert_not_called()
+
+    def test_send_with_fault_tolerance_confirms_dlq_write_when_retries_exhaust(self):
+        """Failure path must preserve to DLQ with broker confirmation requirements."""
+        underlying = Mock()
+        routing = Mock()
+        routing.send_to_topic.side_effect = RuntimeError("broker rejected message")
+        config = FaultToleranceConfig(max_retries=0, delivery_confirmation_timeout_seconds=4.0)
+
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+        result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-2002"},
+        )
+
+        self.assertFalse(result.success)
+        underlying.send.assert_called_once()
+        self.assertEqual(underlying.send.call_args.args[0], "payments-dead-letter-queue")
+        dlq_kwargs = underlying.send.call_args.kwargs
+        self.assertTrue(dlq_kwargs["require_delivery_confirmation"])
+        self.assertEqual(dlq_kwargs["delivery_timeout_seconds"], 4.0)
+
     def test_sliding_window_snapshot_reports_metrics_without_lock_reentry(self):
         """Snapshot should compute metrics in one lock scope and return consistent values."""
         monitor = SlidingWindowHealthMonitor(
@@ -155,6 +204,46 @@ class DeadLetterQueueProducerTests(unittest.TestCase):
             create_producer.return_value = fake_producer
 
             run_demo(bootstrap_servers="localhost:19094")
+
+            create_producer.assert_called_once()
+            self.assertEqual(
+                create_producer.call_args.kwargs["bootstrap_servers"],
+                "localhost:19094",
+            )
+
+    def test_run_demo_resolves_bootstrap_servers_when_override_is_missing(self):
+        """Demo should resolve bootstrap servers from helper when caller gives no override."""
+        fake_producer = Mock()
+        fake_producer.health_status.return_value = {
+            "circuit_breaker": {"state": "closed", "failure_count": 0},
+            "bulkhead": {"active_count": 0, "max_concurrent_sends": 100},
+            "health_monitor": {
+                "total_operations": 0,
+                "total_errors": 0,
+                "window_error_rate": 0.0,
+                "avg_latency_seconds": 0.0,
+                "is_healthy": True,
+                "window_sample_count": 0,
+            },
+        }
+        fake_producer.send_with_fault_tolerance.return_value = SendAttemptResult(
+            success=True,
+            retry_count=0,
+            circuit_state=CircuitState.CLOSED,
+        )
+
+        with (
+            patch("producers.dead_letter_queue.demo.read_demo_bootstrap_servers") as read_bootstrap,
+            patch("producers.dead_letter_queue.demo.create_dlq_producer") as create_producer,
+            patch("producers.dead_letter_queue.demo._print_json"),
+            patch("producers.dead_letter_queue.demo._explain_config"),
+            patch("producers.dead_letter_queue.demo.logger.info"),
+            patch("producers.dead_letter_queue.demo.logger.warning"),
+        ):
+            read_bootstrap.return_value = "localhost:19094"
+            create_producer.return_value = fake_producer
+
+            run_demo()
 
             create_producer.assert_called_once()
             self.assertEqual(

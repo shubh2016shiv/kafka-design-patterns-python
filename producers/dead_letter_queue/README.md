@@ -687,7 +687,24 @@ Range:   1.0 – 120.0 (practical)
 Maximum time a thread waits to acquire a bulkhead slot. Must be shorter than the caller's
 own SLA timeout so the caller can react to the failure before its deadline expires.
 
-### 8.4 Health Monitor Parameters
+### 8.4 Delivery Confirmation Parameter
+
+#### `delivery_confirmation_timeout_seconds`
+
+```
+Default: 10.0
+Range:   1.0 - 60.0 (practical)
+```
+
+Maximum time each send attempt waits for broker acknowledgement before treating
+the attempt as failed.
+
+Why this matters:
+- `produce()` queueing alone is not delivery.
+- with this timeout, `SendAttemptResult.success=True` means broker-confirmed delivery.
+- if the callback never arrives before timeout, the send attempt enters retry/DLQ flow.
+
+### 8.5 Health Monitor Parameters
 
 #### `health_window_size`
 
@@ -715,7 +732,7 @@ Error rate above which `is_healthy` returns False. Use this threshold for alerti
 auto-scaling decisions. A 10% error rate means 1 in 10 messages is failing — this is
 a signal worth paging someone for in a payments service.
 
-### 8.5 Configuration Summary Table
+### 8.6 Configuration Summary Table
 
 | Parameter | Default | HA Preset | Conservative | Aggressive |
 |---|---|---|---|---|
@@ -727,6 +744,7 @@ a signal worth paging someone for in a payments service.
 | `max_retry_delay_seconds` | 30.0 | 30.0 | 60.0 | 5.0 |
 | `max_concurrent_sends` | 100 | 200 | 50 | 500 |
 | `send_timeout_seconds` | 30.0 | 30.0 | 60.0 | 5.0 |
+| `delivery_confirmation_timeout_seconds` | 10.0 | 10.0 | 20.0 | 5.0 |
 | `error_rate_unhealthy_threshold` | 0.10 | 0.05 | 0.05 | 0.20 |
 
 Use `create_dlq_producer()` for default settings. Use `create_ha_dlq_producer()` for the HA preset.
@@ -972,6 +990,29 @@ Every service that uses the DLQ producer needs a replay plan:
 Never replay from DLQ without first fixing the root cause. Replaying into a broken pipeline
 just re-populates the DLQ.
 
+### Step 6: Use battle-tested libraries when you want less custom resilience logic
+
+Yes, this design can be implemented with industry-standard Python libraries.
+
+Recommended mapping:
+
+| Concern | Current implementation | Library-backed option |
+|---|---|---|
+| Circuit breaker | `CircuitBreaker` in `core.py` | [`pybreaker`](https://github.com/danielfm/pybreaker) |
+| Retry/backoff | `_execute_with_retry` loop | [`tenacity`](https://github.com/jd/tenacity) |
+| Bulkhead | `threading.Semaphore` wrapper | `threading.BoundedSemaphore` (stdlib, production-grade) |
+| Health metrics | Sliding deque in `SlidingWindowHealthMonitor` | `prometheus-client` counters/histograms + alerting rules |
+
+Practical migration plan:
+
+1. Replace circuit state transitions with `pybreaker.CircuitBreaker` while preserving
+   current `SendAttemptResult` fields.
+2. Move retry logic to `tenacity` with explicit `stop_after_attempt` and
+   `wait_exponential` settings derived from `FaultToleranceConfig`.
+3. Keep bulkhead behavior with `BoundedSemaphore` unless you move to an async runtime.
+4. Export health as metrics (`prometheus-client`) and keep result objects for caller ergonomics.
+5. Roll out behind a feature flag and compare success/error/latency distributions in staging.
+
 ---
 
 ## 12. Running the Demo
@@ -998,55 +1039,49 @@ python -m producers.dead_letter_queue.demo
 
 What happens:
 
-1. Logs the full four-layer pattern diagram to show where you are in the architecture.
-2. Builds a `DeadLetterQueueProducer` with short retry delays (demo-friendly).
-   You can pin endpoints explicitly via `run_demo(bootstrap_servers=\"localhost:19094\")`
-   to prevent accidental cluster targeting in multi-environment setups.
-3. Logs the initial circuit state and health snapshot (everything CLOSED and healthy).
-4. Sends a `demo-service-events` message through all four layers.
-5. Logs the `SendAttemptResult` — success, retry count, elapsed time, circuit state.
-6. Logs the post-send health snapshot to show the sliding window updated.
-7. Explains every `FaultToleranceConfig` field so you understand each knob.
+1. Logs the four-layer pattern overview so you can follow the execution path.
+2. Resolves bootstrap servers in this order:
+   - explicit `run_demo(bootstrap_servers=...)` override,
+   - `infrastructure/.env` (`KAFKA_EXTERNAL_HOST` + `KAFKA_EXTERNAL_PORT`),
+   - fallback to `localhost:19094` for host-machine Docker access.
+3. Builds a `DeadLetterQueueProducer` with short retry delays (demo-friendly).
+4. Logs the initial circuit state and health snapshot.
+5. Sends a `demo-service-events` message through all layers.
+6. Logs the `SendAttemptResult` with broker-confirmed semantics.
+   - `success=True` now means the broker acknowledged delivery within timeout.
+   - queue-only local buffering is treated as incomplete (not success).
+7. Logs the post-send health snapshot and configuration explanations.
 
 ### Expected output (healthy broker)
 
 ```
 INFO  ============================================================
-INFO  Dead Letter Queue Producer — pattern walkthrough
-INFO  ...pattern diagram...
-INFO  Stage 1.0 — Building DeadLetterQueueProducer...
-INFO  CircuitBreaker initialised — failure_threshold=3, recovery_timeout=10s
-INFO  Bulkhead initialised — max_concurrent_sends=100
-INFO  DeadLetterQueueProducer ready — service=demo-service, dlq_enabled=True
-INFO  Stage 2.0 — Initial health status:
-      { "circuit_breaker": {"state": "closed", "failure_count": 0}, ... }
-INFO  Stage 3.0 — Sending message to topic 'demo-service-events'...
-INFO  Message delivered to demo-service-events [0] @ offset 3
-INFO  Stage 3.1 ✓ Message delivered. retry_count=0, elapsed=0.045s, circuit=closed
-INFO  Stage 4.0 — Post-send health status:
-      { "health_monitor": {"window_error_rate": 0.0, "is_healthy": true, ...}, ... }
-INFO  Stage 5.0 — Configuration explanation:
-      failure_threshold   Trips the circuit after 3 consecutive failures...
-      ...
+INFO  Dead Letter Queue Producer - pattern walkthrough
+INFO  Stage 1.0 - Building DeadLetterQueueProducer...
+INFO  DeadLetterQueueProducer ready - service=demo-service, dlq_enabled=True
+INFO  Resolved demo bootstrap servers: localhost:19094
+INFO  Stage 2.0 - Initial health status: ...
+INFO  Stage 3.0 - Sending message to topic 'demo-service-events'...
+INFO  Stage 3.1 [OK] Message delivered. retry_count=0, elapsed=..., circuit=closed
+INFO  Stage 4.0 - Post-send health status: ...
+INFO  Stage 5.0 - Configuration explanation: ...
 ```
 
-### Expected output (broker unreachable)
+### Expected output (broker unreachable or topic missing)
 
 ```
-INFO  Stage 3.0 — Sending message to topic 'demo-service-events'...
-WARN  Send attempt 1/3 failed for service=demo-service — retrying in 0.50s. Error: ...
-WARN  Send attempt 2/3 failed for service=demo-service — retrying in 1.00s. Error: ...
-ERROR All 3 send attempts exhausted for service=demo-service.
-WARN  CircuitBreaker → OPEN (failure_threshold=3 exceeded)
-INFO  DLQ preserved — service=demo-service, dlq_topic=demo-service-dead-letter-queue
-WARN  Stage 3.1 ✗ Message delivery failed after 2 retries (3.241s elapsed).
+INFO  Stage 3.0 - Sending message to topic 'demo-service-events'...
+WARN  Send attempt 1/3 failed ... retrying in 0.50s
+WARN  Send attempt 2/3 failed ... retrying in 1.00s
+ERROR All 3 send attempts exhausted for service=demo-service, topic=demo-service-events ...
+CRITICAL CRITICAL: DLQ send also failed - message may be permanently lost ...
+WARN  Stage 3.1 [FAIL] Message delivery failed after 2 retries (... elapsed).
       Message was routed to DLQ: demo-service-dead-letter-queue
-      Circuit state after failure: open
-      Error: <KafkaException: ...>
+      Error: ...
 ```
 
-The DLQ topic `demo-service-dead-letter-queue` will contain the full failure envelope
-visible in Kafka UI under Topics → demo-service-dead-letter-queue → Messages.
+The DLQ topic `demo-service-dead-letter-queue` will contain the failure envelope only when the
+DLQ write itself is broker-confirmed.
 
 ### Run with High Availability preset
 

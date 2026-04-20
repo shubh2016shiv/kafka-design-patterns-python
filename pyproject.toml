@@ -1,3 +1,25 @@
+[project]
+name = "kafka-version-3"
+version = "0.1.0"
+description = "Enterprise Kafka producer and consumer design patterns."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Primary Kafka clients used across producer and consumer patterns.
+    "confluent-kafka>=2.6.0",
+    "kafka-python>=2.0.2",
+    # Operational metrics in infrastructure/health scripts.
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+# Battle-tested resilience stack for future migration from bespoke logic.
+resilience = [
+    "pybreaker>=1.4.0",
+    "tenacity>=9.0.0",
+    "prometheus-client>=0.20.0",
+]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100

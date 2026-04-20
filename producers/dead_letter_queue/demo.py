@@ -5,15 +5,14 @@ Run against a local broker:
     python -m producers.dead_letter_queue.demo
 
 What this demo exercises (in order):
-  Stage 1  — Build the producer with short demo-friendly retry delays.
-  Stage 2  — Show initial circuit + health status (everything CLOSED / healthy).
-  Stage 3  — Send a normal message; report the structured result.
-  Stage 4  — Show post-send health snapshot; compare with initial state.
-  Stage 5  — Explain each config field so the reader understands every knob.
+  Stage 1  - Build the producer with short demo-friendly retry delays.
+  Stage 2  - Show initial circuit + health status (everything CLOSED / healthy).
+  Stage 3  - Send a normal message; report the structured result.
+  Stage 4  - Show post-send health snapshot; compare with initial state.
+  Stage 5  - Explain each config field so the reader understands every knob.
 
 Prerequisites:
-  - Kafka broker reachable at the address in config/kafka_config.py DEVELOPMENT
-    settings (default: localhost:9092).
+  - Kafka broker reachable at the resolved bootstrap servers.
   - The target topic exists, or auto-create is enabled on the broker.
 
 Learning goals:
@@ -29,7 +28,8 @@ import json
 import logging
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional
 
 # Import the primary entry point and config from this package.
 from .core import (
@@ -39,55 +39,68 @@ from .core import (
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     stream=sys.stdout,
 )
 logger = logging.getLogger("producers.dead_letter_queue.demo")
 
 
-# ── Public demo API ────────────────────────────────────────────────────────────
+def read_demo_bootstrap_servers() -> str:
+    """
+    Resolve bootstrap servers for local demo execution.
+
+    Stage 1.0:
+    Prefer infrastructure/.env KAFKA_EXTERNAL_HOST + KAFKA_EXTERNAL_PORT when present.
+    Stage 1.1:
+    Fall back to localhost:19094 so host-machine demos match container external listeners.
+    """
+    env_file_path = Path(__file__).resolve().parents[2] / "infrastructure" / ".env"
+    default_host = "localhost"
+    default_port = "19094"
+    if not env_file_path.exists():
+        return f"{default_host}:{default_port}"
+
+    env_values: Dict[str, str] = {}
+    for raw_line in env_file_path.read_text(encoding="utf-8").splitlines():
+        normalized_line = raw_line.strip()
+        if not normalized_line or normalized_line.startswith("#") or "=" not in normalized_line:
+            continue
+        key, value = normalized_line.split("=", maxsplit=1)
+        env_values[key.strip()] = value.strip()
+
+    host = env_values.get("KAFKA_EXTERNAL_HOST", default_host)
+    port = env_values.get("KAFKA_EXTERNAL_PORT", default_port)
+    return f"{host}:{port}"
 
 
 def run_demo(bootstrap_servers: Optional[str] = None) -> None:
     """
     Walk through the DLQ pattern with annotated, step-by-step execution.
 
-    Input:  bootstrap_servers — optional override (e.g. "localhost:9092").
-                                When None, DEVELOPMENT config defaults apply.
+    Input:  bootstrap_servers - optional override (for example "localhost:19094").
+            When None, demo bootstrap resolution reads infrastructure/.env and
+            falls back to localhost:19094.
     """
     service_name = "demo-service"
+    resolved_bootstrap_servers = bootstrap_servers or read_demo_bootstrap_servers()
 
-    # ── Pattern overview ───────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("Dead Letter Queue Producer — pattern walkthrough")
+    logger.info("Dead Letter Queue Producer - pattern walkthrough")
     logger.info("=" * 60)
     logger.info(
         "\n"
-        "  Four fault-tolerance layers (outermost → innermost):\n"
+        "Four fault-tolerance layers (outermost -> innermost):\n"
         "\n"
-        "  ┌─ Circuit Breaker ─────────────────────────────────────┐\n"
-        "  │  Fast-fail when the broker is known bad.              │\n"
-        "  │  Prevents hammering a struggling broker.              │\n"
-        "  │                                                       │\n"
-        "  │  ┌─ Bulkhead ───────────────────────────────────────┐ │\n"
-        "  │  │  Caps in-flight sends.  Protects app threads.    │ │\n"
-        "  │  │                                                  │ │\n"
-        "  │  │  ┌─ Retry + Exponential Backoff ───────────────┐ │ │\n"
-        "  │  │  │  Recovers from transient broker blips.      │ │ │\n"
-        "  │  │  │                                             │ │ │\n"
-        "  │  │  │  ┌─ Dead Letter Queue (DLQ) ─────────────┐ │ │ │\n"
-        "  │  │  │  │  Preserves messages that exhaust      │ │ │ │\n"
-        "  │  │  │  │  retries for later replay / triage.   │ │ │ │\n"
-        "  │  │  │  └───────────────────────────────────────┘ │ │ │\n"
-        "  │  │  └─────────────────────────────────────────────┘ │ │\n"
-        "  │  └──────────────────────────────────────────────────┘ │\n"
-        "  └────────────────────────────────────────────────────────┘\n"
+        "  [Circuit Breaker] -> [Bulkhead] -> [Retry + Backoff] -> [DLQ]\n"
+        "\n"
+        "  Circuit Breaker : Fast-fail when broker is known bad.\n"
+        "  Bulkhead        : Cap in-flight sends to protect app threads.\n"
+        "  Retry + Backoff : Recover from transient broker issues.\n"
+        "  DLQ             : Preserve exhausted messages for replay and triage."
     )
 
-    # Stage 1.0 — Build the producer with demo-friendly short retry delays.
-    # In production use create_dlq_producer() or create_ha_dlq_producer() which
-    # apply the right defaults automatically.
-    logger.info("Stage 1.0 — Building DeadLetterQueueProducer...")
+    # Stage 1.0 - Build producer with demo-friendly short retry delays.
+    logger.info("Stage 1.0 - Building DeadLetterQueueProducer...")
     demo_config = FaultToleranceConfig(
         failure_threshold=3,
         recovery_timeout_seconds=10,  # short for demo; default is 60 s
@@ -96,20 +109,18 @@ def run_demo(bootstrap_servers: Optional[str] = None) -> None:
         max_retry_delay_seconds=2.0,
         send_timeout_seconds=5.0,
     )
-    # Safety note:
-    # bootstrap_servers override is wired into producer creation so local demos
-    # never have to rely on implicit defaults that could target another cluster.
     producer = create_dlq_producer(
         service_name=service_name,
         config=demo_config,
-        bootstrap_servers=bootstrap_servers,
+        bootstrap_servers=resolved_bootstrap_servers,
     )
+    logger.info("Resolved demo bootstrap servers: %s", resolved_bootstrap_servers)
 
-    # Stage 2.0 — Inspect initial state before any sends.
-    logger.info("Stage 2.0 — Initial health status:")
+    # Stage 2.0 - Inspect initial state before any sends.
+    logger.info("Stage 2.0 - Initial health status:")
     _print_json(producer.health_status())
 
-    # Stage 3.0 — Attempt a normal message send.
+    # Stage 3.0 - Attempt a normal message send.
     demo_payload = {
         "event": "order.created",
         "order_id": "ord-demo-001",
@@ -118,24 +129,24 @@ def run_demo(bootstrap_servers: Optional[str] = None) -> None:
         "sent_at_unix": int(time.time()),
     }
     target_topic = f"{service_name}-events"
-    logger.info("Stage 3.0 — Sending message to topic '%s'...", target_topic)
+    logger.info("Stage 3.0 - Sending message to topic '%s'...", target_topic)
 
     result = producer.send_with_fault_tolerance(
         topic=target_topic,
         data=demo_payload,
     )
 
-    # Stage 3.1 — Interpret the structured result.
+    # Stage 3.1 - Interpret the structured result.
     if result.success:
         logger.info(
-            "Stage 3.1 ✓ Message delivered.\n  retry_count=%d, elapsed=%.3fs, circuit=%s",
+            "Stage 3.1 [OK] Message delivered.\n  retry_count=%d, elapsed=%.3fs, circuit=%s",
             result.retry_count,
             result.execution_time_seconds,
             result.circuit_state.value,
         )
     else:
         logger.warning(
-            "Stage 3.1 ✗ Message delivery failed after %d retries (%.3fs elapsed).\n"
+            "Stage 3.1 [FAIL] Message delivery failed after %d retries (%.3fs elapsed).\n"
             "  Message was routed to DLQ: %s\n"
             "  Circuit state after failure: %s\n"
             "  Error: %s",
@@ -146,20 +157,17 @@ def run_demo(bootstrap_servers: Optional[str] = None) -> None:
             result.error,
         )
 
-    # Stage 4.0 — Post-send health snapshot to see how the monitor updated.
-    logger.info("Stage 4.0 — Post-send health status:")
+    # Stage 4.0 - Post-send health snapshot to see how the monitor updated.
+    logger.info("Stage 4.0 - Post-send health status:")
     _print_json(producer.health_status())
 
-    # Stage 5.0 — Config explanation for interview / onboarding readiness.
-    logger.info("Stage 5.0 — Configuration explanation:")
+    # Stage 5.0 - Config explanation for interview / onboarding readiness.
+    logger.info("Stage 5.0 - Configuration explanation:")
     _explain_config(demo_config)
 
     logger.info("=" * 60)
     logger.info("Demo complete.")
     logger.info("=" * 60)
-
-
-# ── Helper utilities ───────────────────────────────────────────────────────────
 
 
 def _print_json(data: dict) -> None:
@@ -172,7 +180,7 @@ def _explain_config(config: FaultToleranceConfig) -> None:
     Log a human-readable explanation of every FaultToleranceConfig field.
 
     This is the kind of explanation you would give in an interview or
-    during an on-call handover — what each knob does and why it's set
+    during an on-call handover - what each knob does and why it's set
     to its current value.
     """
     explanations = {
@@ -211,6 +219,10 @@ def _explain_config(config: FaultToleranceConfig) -> None:
         "send_timeout_seconds": (
             f"{config.send_timeout_seconds}s max wait for a bulkhead slot. "
             "Should be shorter than the caller's own SLA timeout."
+        ),
+        "delivery_confirmation_timeout_seconds": (
+            f"{config.delivery_confirmation_timeout_seconds}s max wait for broker delivery ack. "
+            "Protects reliability by treating queue-only sends as incomplete."
         ),
         "health_window_size": (
             f"Error rate computed over the last {config.health_window_size} operations. "

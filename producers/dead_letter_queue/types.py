@@ -127,6 +127,11 @@ class FaultToleranceConfig:
     """Maximum wait to acquire a bulkhead slot.  Should be less than the
     caller's own SLA timeout so the caller can react before its deadline."""
 
+    delivery_confirmation_timeout_seconds: float = 10.0
+    """Maximum time to wait for broker delivery acknowledgement per send attempt.
+    This timeout protects caller latency budgets while still ensuring that
+    `success=True` means broker-confirmed delivery, not just local queueing."""
+
     # ── Sliding-Window Health Monitor ─────────────────────────────────────────
 
     health_window_size: int = 100
