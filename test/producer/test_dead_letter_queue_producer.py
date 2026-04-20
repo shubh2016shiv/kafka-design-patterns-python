@@ -5,6 +5,8 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+from pybreaker import CircuitBreakerError
+
 # Test shims:
 # dead_letter_queue clients import singleton/topic-routing modules at import
 # time; those modules pull environment-specific dependencies and package paths.
@@ -20,22 +22,42 @@ if "producers.singleton.singleton_producer" not in sys.modules:
     fake_singleton_module.SingletonProducer = _FakeSingletonProducer
     sys.modules["producers.singleton.singleton_producer"] = fake_singleton_module
 
-if "producers.topic_routing.topic_routing_producer" not in sys.modules:
-    fake_routing_module = types.ModuleType("producers.topic_routing.topic_routing_producer")
+if "producers.content_based_router.core" not in sys.modules:
+    fake_router_core = types.ModuleType("producers.content_based_router.core")
 
-    class _FakeTopicRoutingProducer:  # pragma: no cover - import shim only
-        def __init__(self, service_name, producer=None):
+    class _FakeContentBasedRouter:  # pragma: no cover - import shim only
+        def __init__(self, service_name, _dispatcher=None, **_kwargs):
             self.service_name = service_name
-            self.producer = producer
 
-        def send_to_topic(self, topic, data, **kwargs):
+        def send_direct(self, _topic, _data, **_kwargs):
             return None
 
-        def send_with_metadata(self, data, metadata, **kwargs):
+        def send_with_context(self, _data, _context, **_kwargs):
             return None
 
-    fake_routing_module.TopicRoutingProducer = _FakeTopicRoutingProducer
-    sys.modules["producers.topic_routing.topic_routing_producer"] = fake_routing_module
+    fake_router_core.ContentBasedRouter = _FakeContentBasedRouter
+    sys.modules["producers.content_based_router.core"] = fake_router_core
+
+if "producers.content_based_router.clients" not in sys.modules:
+    fake_router_clients = types.ModuleType("producers.content_based_router.clients")
+
+    class _FakeSingletonProducerGateway:  # pragma: no cover - import shim only
+        def __init__(self, underlying_producer):
+            self._producer = underlying_producer
+
+    fake_router_clients.SingletonProducerGateway = _FakeSingletonProducerGateway
+    sys.modules["producers.content_based_router.clients"] = fake_router_clients
+
+if "producers.content_based_router.types" not in sys.modules:
+    fake_router_types = types.ModuleType("producers.content_based_router.types")
+
+    class _FakeMessageRoutingContext:  # pragma: no cover - import shim only
+        def __init__(self, priority=None, source_service=None, **kwargs):
+            self.priority = priority
+            self.source_service = source_service
+
+    fake_router_types.MessageRoutingContext = _FakeMessageRoutingContext
+    sys.modules["producers.content_based_router.types"] = fake_router_types
 
 from config.kafka_config import Environment
 from producers.dead_letter_queue.core import (
@@ -153,6 +175,127 @@ class DeadLetterQueueProducerTests(unittest.TestCase):
         dlq_kwargs = underlying.send.call_args.kwargs
         self.assertTrue(dlq_kwargs["require_delivery_confirmation"])
         self.assertEqual(dlq_kwargs["delivery_timeout_seconds"], 4.0)
+
+    def test_circuit_open_fast_fails_without_secondary_network_send(self):
+        """Once the circuit opens, the next call should fast-fail before routing/DLQ network sends."""
+        underlying = Mock()
+        routing = Mock()
+        routing.send_to_topic.side_effect = RuntimeError("broker down")
+        config = FaultToleranceConfig(
+            failure_threshold=1,
+            recovery_timeout_seconds=120,
+            max_retries=3,
+            initial_retry_delay_seconds=0.0,
+            max_retry_delay_seconds=0.0,
+        )
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+
+        first_result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-cb-open-1"},
+        )
+        second_result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-cb-open-2"},
+        )
+
+        self.assertFalse(first_result.success)
+        self.assertFalse(second_result.success)
+        self.assertIn("Circuit breaker OPEN", str(second_result.error))
+        self.assertEqual(routing.send_to_topic.call_count, 1)
+        self.assertEqual(underlying.send.call_count, 1)
+
+    def test_retry_stops_immediately_when_circuit_breaker_opens(self):
+        """tenacity should stop retrying once pybreaker raises CircuitBreakerError."""
+        underlying = Mock()
+        routing = Mock()
+        routing.send_to_topic.side_effect = RuntimeError("broker timeout")
+        config = FaultToleranceConfig(
+            failure_threshold=1,
+            max_retries=5,
+            initial_retry_delay_seconds=0.0,
+            max_retry_delay_seconds=0.0,
+        )
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+
+        result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-stop-open"},
+        )
+
+        self.assertFalse(result.success)
+        self.assertIsInstance(result.error, CircuitBreakerError)
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(routing.send_to_topic.call_count, 1)
+        underlying.send.assert_called_once()
+
+    def test_retry_count_tracks_tenacity_attempts_when_send_eventually_succeeds(self):
+        """Result retry_count should reflect failed attempts before final success."""
+        underlying = Mock()
+        routing = Mock()
+        routing.send_to_topic.side_effect = [
+            RuntimeError("transient-1"),
+            RuntimeError("transient-2"),
+            None,
+        ]
+        config = FaultToleranceConfig(
+            failure_threshold=10,
+            max_retries=5,
+            initial_retry_delay_seconds=0.0,
+            max_retry_delay_seconds=0.0,
+        )
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+
+        result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-retry-success"},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.retry_count, 2)
+        self.assertEqual(routing.send_to_topic.call_count, 3)
+        underlying.send.assert_not_called()
+
+    def test_bulkhead_active_count_returns_to_zero_after_send_completion(self):
+        """Bulkhead slot must always be released, even when send ends in failure."""
+        underlying = Mock()
+        routing = Mock()
+        routing.send_to_topic.side_effect = RuntimeError("persistent failure")
+        config = FaultToleranceConfig(
+            failure_threshold=10,
+            max_retries=0,
+            initial_retry_delay_seconds=0.0,
+            max_retry_delay_seconds=0.0,
+        )
+        producer = DeadLetterQueueProducer(
+            service_name="payments",
+            config=config,
+            underlying_producer=underlying,
+            routing_producer=routing,
+        )
+
+        result = producer.send_with_fault_tolerance(
+            topic="payments-events",
+            data={"transaction_id": "txn-bulkhead-release"},
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(producer._bulkhead.active_count, 0)
 
     def test_sliding_window_snapshot_reports_metrics_without_lock_reentry(self):
         """Snapshot should compute metrics in one lock scope and return consistent values."""

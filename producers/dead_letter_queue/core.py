@@ -55,8 +55,8 @@ ASCII flow — send_with_fault_tolerance() full decision path:
           ▼
     ┌─────────────────────────────────────────┐
     │ Stage 4.0  Record outcome               │
-    │  success? ──► circuit_breaker.record_success()│
-    │  failure? ──► circuit_breaker.record_failure()│
+    │  success? ──► pybreaker protected-call success│
+    │  failure? ──► pybreaker protected-call failure│
     │              + Stage 4.1 DLQ send       │
     └─────────────────────────────────────────┘
           │
@@ -73,6 +73,9 @@ from __future__ import annotations
 
 # json — DLQ envelope serialisation for the failed-message payload.
 
+# datetime — pybreaker stores opened timestamps as UTC datetimes; used for probe gating.
+from datetime import datetime, timezone
+
 # logging — structured operational log lines at each stage transition.
 import logging
 
@@ -87,7 +90,19 @@ import time
 from collections import deque
 
 # typing — explicit contracts on every public method and helper.
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
+
+# pybreaker — battle-tested circuit-breaker state machine and failure counting.
+from pybreaker import (
+    CircuitBreaker as PyBreakerCircuitBreaker,
+    CircuitBreakerError,
+    STATE_CLOSED,
+    STATE_HALF_OPEN,
+    STATE_OPEN,
+)
+
+# tenacity — battle-tested retry orchestration with configurable exponential backoff.
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .clients import default_routing_producer_factory, default_underlying_producer_factory
 from .constants import (
@@ -115,44 +130,55 @@ except ImportError:  # pragma: no cover - package install fallback.
 logger = logging.getLogger(__name__)
 
 
+_PYBREAKER_STATE_TO_CIRCUIT_STATE: dict[str, CircuitState] = {
+    STATE_CLOSED: CircuitState.CLOSED,
+    STATE_OPEN: CircuitState.OPEN,
+    STATE_HALF_OPEN: CircuitState.HALF_OPEN,
+    # Defensive normalization in case upstream emits hyphenated names.
+    "half-open": CircuitState.HALF_OPEN,
+}
+
+
 # ── Circuit Breaker ────────────────────────────────────────────────────────────
 
 
 class CircuitBreaker:
     """
-    Thread-safe circuit breaker controlling access to the Kafka broker.
+    Compatibility wrapper around ``pybreaker.CircuitBreaker``.
 
-    Why the circuit breaker sits BEFORE the retry loop:
-    - Retrying against an OPEN circuit wastes resources and delays recovery.
-      The breaker short-circuits the retry loop entirely when the broker is
-      confirmed unavailable, enabling faster fail-back to the DLQ path and
-      giving the broker headroom to restart without being hammered.
+    Why this wrapper exists:
+    - Preserve this package's public API (`state`, `failure_count`, `can_execute`,
+      `reset`) while using a battle-tested circuit implementation internally.
+    - Map pybreaker runtime state names to the local `CircuitState` enum so
+      `SendAttemptResult` and `health_status()` stay backward compatible.
 
-    State transitions (see CircuitState docstring for diagram):
-    - record_failure() trips CLOSED → OPEN once failure_threshold is exceeded.
-    - can_execute()   transitions OPEN → HALF_OPEN when recovery_timeout elapses.
-    - record_success() closes HALF_OPEN → CLOSED after success_threshold successes.
-    - record_failure() reopens HALF_OPEN → OPEN on any probe failure.
-
-    Thread safety:
-    - A single threading.Lock guards all state reads-that-also-write (can_execute).
-    - time.monotonic() is used for timeout checks to avoid wall-clock skew.
+    Main responsibility boundaries:
+    - pybreaker tracks failures, successes, and OPEN/HALF_OPEN/CLOSED transitions
+      during protected calls (`call(...)`).
+    - this wrapper provides a pre-check gate (`can_execute`) used before bulkhead
+      acquisition to fast-fail callers while the circuit is OPEN and still in the
+      blackout window.
     """
 
     def __init__(self, config: FaultToleranceConfig) -> None:
         """
-        Input:  config — failure_threshold, recovery_timeout_seconds,
-                         success_threshold from FaultToleranceConfig.
-        Output: circuit initialised in CLOSED (normal operation) state.
+        Input:
+          config.failure_threshold        -> pybreaker fail_max
+          config.recovery_timeout_seconds -> pybreaker reset_timeout
+          config.success_threshold        -> pybreaker success_threshold
+
+        Output:
+          A wrapper over a pybreaker instance initialized in CLOSED state.
         """
         self._config = config
-        self._state = CircuitState.CLOSED
-        self._failure_count: int = 0
-        self._success_count: int = 0
-        self._last_failure_monotonic: float = 0.0
         self._lock = threading.Lock()
+        self._breaker = PyBreakerCircuitBreaker(
+            fail_max=config.failure_threshold,
+            reset_timeout=config.recovery_timeout_seconds,
+            success_threshold=config.success_threshold,
+        )
         logger.info(
-            "CircuitBreaker initialised — failure_threshold=%d, recovery_timeout=%ds",
+            "CircuitBreaker initialised (pybreaker) - failure_threshold=%d, recovery_timeout=%ds",
             config.failure_threshold,
             config.recovery_timeout_seconds,
         )
@@ -161,13 +187,19 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CircuitState:
-        """Current circuit state (safe to read outside the lock for logging)."""
-        return self._state
+        """
+        Current circuit state mapped from pybreaker to local enum values.
+
+        Failure behavior:
+        - Unknown upstream state values are treated as OPEN (fail-safe).
+        """
+        pybreaker_state = self._breaker.current_state
+        return _PYBREAKER_STATE_TO_CIRCUIT_STATE.get(pybreaker_state, CircuitState.OPEN)
 
     @property
     def failure_count(self) -> int:
-        """Running failure count within the current CLOSED window."""
-        return self._failure_count
+        """Current pybreaker failure counter for visibility and health reporting."""
+        return int(self._breaker.fail_counter)
 
     # ── State machine ──────────────────────────────────────────────────────────
 
@@ -175,87 +207,61 @@ class CircuitBreaker:
         """
         Return True if the caller is allowed to attempt a Kafka send.
 
-        Side effect: may transition OPEN → HALF_OPEN when the recovery timeout
-        has elapsed.  This is intentional — the check IS the transition trigger,
-        eliminating the need for a background watchdog thread.
+        Output:
+          False for OPEN circuits while blackout window is still active.
+          True for CLOSED/HALF_OPEN states, and for OPEN when timeout elapsed
+          (allowing the upcoming protected call to become the probe).
 
-        Output: False for OPEN circuits within the blackout window; True otherwise.
-        Failure behavior: returns False (not raises) so callers receive a result object.
+        Failure behavior:
+          Returns False instead of raising so callers can return a structured
+          SendAttemptResult fast-fail.
         """
         with self._lock:
-            if self._state is CircuitState.CLOSED:
+            if self.state is not CircuitState.OPEN:
                 return True
 
-            if self._state is CircuitState.OPEN:
-                # Stage 1.0: check if the broker recovery window has elapsed.
-                elapsed = time.monotonic() - self._last_failure_monotonic
-                if elapsed >= self._config.recovery_timeout_seconds:
-                    # Stage 1.1: transition to HALF_OPEN for a recovery probe.
-                    self._state = CircuitState.HALF_OPEN
-                    self._success_count = 0
-                    logger.info(
-                        "CircuitBreaker → HALF_OPEN after %.1fs recovery window (service probe begins)",
-                        elapsed,
-                    )
-                    return True
-                return False  # still within OPEN blackout window
+            elapsed_seconds = self._seconds_since_open()
+            if elapsed_seconds is None:
+                return False
 
-            # HALF_OPEN: allow through to probe whether the broker has recovered.
-            return True
+            return elapsed_seconds >= float(self._config.recovery_timeout_seconds)
+
+    def call(self, protected_call: Callable[[], Any]) -> Any:
+        """
+        Execute one protected operation through pybreaker.
+
+        Input:
+          protected_call: callback that performs exactly one broker-facing send.
+
+        Output:
+          Whatever the callback returns.
+
+        Failure behavior:
+          - Raises the callback exception for normal failures.
+          - Raises CircuitBreakerError when circuit is OPEN or when threshold trip
+            happens on this call.
+        """
+        return self._breaker.call(protected_call)
 
     def record_success(self) -> None:
         """
-        Record a successful send outcome.
+        Compatibility hook for external callers.
 
-        In HALF_OPEN: accumulate successes; close the circuit when threshold met.
-        In CLOSED:    decay the failure count by 1 (gradual self-healing under
-                      light, intermittent errors without a full state transition).
-
-        Why decay instead of reset in CLOSED:
-        - Resetting to 0 on every success would let a send pattern of
-          [fail, succeed, fail, succeed, …] never trip the breaker.
-          Decay (max(0, count-1)) lets the breaker open eventually.
+        The production send path now records outcomes via `call(...)` directly.
+        This method is intentionally a no-op to preserve API shape without
+        duplicating state transitions.
         """
-        with self._lock:
-            if self._state is CircuitState.HALF_OPEN:
-                self._success_count += 1
-                if self._success_count >= self._config.success_threshold:
-                    self._state = CircuitState.CLOSED
-                    self._failure_count = 0
-                    logger.info(
-                        "CircuitBreaker → CLOSED after %d consecutive probe successes",
-                        self._success_count,
-                    )
-            elif self._state is CircuitState.CLOSED:
-                self._failure_count = max(0, self._failure_count - 1)
+        return None
 
     def record_failure(self) -> None:
         """
-        Record a failed send outcome.
+        Compatibility hook for external callers.
 
-        Increments failure_count; trips CLOSED → OPEN when failure_threshold exceeded.
-        Always reopens the circuit in HALF_OPEN — a failed probe means the broker
-        is still unavailable; don't let a partial recovery mask that.
+        The production send path now records outcomes via `call(...)` directly.
+        This method is intentionally a no-op to preserve API shape without
+        duplicating state transitions.
         """
-        with self._lock:
-            self._failure_count += 1
-            self._last_failure_monotonic = time.monotonic()
-
-            if self._state is CircuitState.HALF_OPEN:
-                self._state = CircuitState.OPEN
-                logger.warning(
-                    "CircuitBreaker → OPEN (recovery probe failed — broker still unavailable)"
-                )
-
-            elif (
-                self._state is CircuitState.CLOSED
-                and self._failure_count >= self._config.failure_threshold
-            ):
-                self._state = CircuitState.OPEN
-                logger.warning(
-                    "CircuitBreaker → OPEN (failure_threshold=%d exceeded — broker flagged unavailable)",
-                    self._config.failure_threshold,
-                )
+        return None
 
     def reset(self) -> None:
         """
@@ -264,11 +270,23 @@ class CircuitBreaker:
         When to use: after manual broker repair when you want the circuit to
         recover immediately rather than waiting for recovery_timeout_seconds.
         """
-        with self._lock:
-            self._state = CircuitState.CLOSED
-            self._failure_count = 0
-            self._success_count = 0
+        self._breaker.close()
         logger.info("CircuitBreaker manually reset to CLOSED by operator")
+
+    def _seconds_since_open(self) -> Optional[float]:
+        """
+        Compute elapsed wall-clock seconds since circuit entered OPEN.
+
+        Why private storage access is used:
+        pybreaker does not expose a public opened-at timestamp accessor, but it
+        does maintain timezone-aware datetime state internally. We read that
+        value only for the pre-send gate check.
+        """
+        opened_at = self._breaker._state_storage.opened_at  # pyright: ignore[reportPrivateUsage]
+        if opened_at is None:
+            return None
+        elapsed = datetime.now(timezone.utc) - opened_at
+        return max(0.0, elapsed.total_seconds())
 
 
 # ── Bulkhead ───────────────────────────────────────────────────────────────────
@@ -286,14 +304,14 @@ class Bulkhead:
     - Named after ship bulkheads that contain flooding within one compartment —
       a Kafka outage should not sink the entire application.
 
-    Implementation: threading.Semaphore with a timed acquire.
+    Implementation: threading.BoundedSemaphore with a timed acquire.
     Failure behavior: acquire() returns False (not raises) when full or timed out,
     so callers receive a structured SendAttemptResult rather than an exception.
     """
 
     def __init__(self, config: FaultToleranceConfig) -> None:
         self._config = config
-        self._semaphore = threading.Semaphore(config.max_concurrent_sends)
+        self._semaphore = threading.BoundedSemaphore(config.max_concurrent_sends)
         self._active_count: int = 0
         self._count_lock = threading.Lock()
         logger.info(
@@ -605,24 +623,17 @@ class DeadLetterQueueProducer:
             # Stage 3.0 — Retry loop with exponential backoff.
             result = self._execute_with_retry(topic, data, routing_metadata, **kwargs)
 
-            # Stage 4.0 — Record outcome in circuit breaker and health monitor.
-            if result.success:
-                # Successful send: decay circuit failure count or close HALF_OPEN.
-                self._circuit_breaker.record_success()
-            else:
-                # All retries exhausted: trip/reinforce the circuit breaker.
-                self._circuit_breaker.record_failure()
-
-                if self.enable_dlq:
-                    # Stage 4.1 — Preserve the failed message in the DLQ topic.
-                    # Runs after circuit_breaker.record_failure() so a fast DLQ
-                    # send error doesn't hide the original outcome.
-                    self._send_to_dlq(
-                        original_topic=topic,
-                        original_data=data,
-                        error=result.error,
-                        routing_metadata=routing_metadata,
-                    )
+            # Stage 4.0 — Record outcome in health monitor.
+            # Circuit transitions are now recorded during protected send calls
+            # inside _execute_with_retry() via pybreaker.
+            if not result.success and self.enable_dlq:
+                # Stage 4.1 — Preserve the failed message in the DLQ topic.
+                self._send_to_dlq(
+                    original_topic=topic,
+                    original_data=data,
+                    error=result.error,
+                    routing_metadata=routing_metadata,
+                )
 
             self._health_monitor.record_operation(result.success, result.execution_time_seconds)
             return result
@@ -649,9 +660,9 @@ class DeadLetterQueueProducer:
         Output: SendAttemptResult (same contract as send_with_fault_tolerance).
         """
         # Import deferred to avoid pulling confluent_kafka into types.py scope.
-        from ..topic_routing.topic_routing_producer import MessageMetadata
+        from ..content_based_router.types import MessageRoutingContext
 
-        metadata = MessageMetadata(priority=priority, source_service=self.service_name)
+        metadata = MessageRoutingContext(priority=priority, source_service=self.service_name)
         return self.send_with_fault_tolerance("", data, routing_metadata=metadata, **kwargs)
 
     # ── Operational / monitoring API ───────────────────────────────────────────
@@ -702,81 +713,111 @@ class DeadLetterQueueProducer:
         **kwargs: Any,
     ) -> SendAttemptResult:
         """
-        Execute the send operation with exponential-backoff retry.
+        Execute one protected send operation through tenacity + pybreaker.
 
-        Why exponential backoff (not uniform retry interval):
-        - Uniform intervals cause "thundering herd" — all retrying callers hit
-          the restarting broker at the same time.  Doubling the delay spreads
-          load over time and gives the broker progressively more recovery space.
+        Why tenacity:
+        - battle-tested retry orchestration (`stop_after_attempt`, `wait_exponential`)
+          replaces hand-rolled loops and sleep math.
+        - gives explicit control to skip retries for specific exceptions.
 
-        Formula: delay_n = min(initial_delay * multiplier^n, max_delay)
+        Why pybreaker call() is wrapped inside each tenacity attempt:
+        - each broker-facing send contributes to the circuit breaker's counters.
+        - when circuit is OPEN, pybreaker raises CircuitBreakerError immediately
+          and tenacity is configured to stop retrying (fast-fail behavior).
 
-        Input:  topic, data, routing_metadata — forwarded from send_with_fault_tolerance.
-        Output: SendAttemptResult from the first success OR after all retries exhausted.
+        Input:
+          topic, data, routing_metadata from send_with_fault_tolerance.
+        Output:
+          SendAttemptResult on first success or final non-retriable/exhausted failure.
         """
         start = time.monotonic()
         last_error: Optional[Exception] = None
-        delay = self.config.initial_retry_delay_seconds
+        attempt_number = 0
 
-        for attempt in range(self.config.max_retries + 1):
-            # Stage 3.1 — Attempt the send via routing or direct topic.
-            try:
-                # Stage 3.1.1:
-                # Force broker confirmation for each send attempt so success means
-                # broker-acknowledged delivery, not just local queueing.
-                send_kwargs = dict(kwargs)
-                send_kwargs["require_delivery_confirmation"] = True
-                send_kwargs["delivery_timeout_seconds"] = (
-                    self.config.delivery_confirmation_timeout_seconds
-                )
+        def _should_retry_exception(exception: BaseException) -> bool:
+            """
+            Decide whether tenacity should schedule another attempt.
 
-                if routing_metadata is not None:
-                    self._routing_producer.send_with_metadata(data, routing_metadata, **send_kwargs)
-                else:
-                    self._routing_producer.send_to_topic(topic, data, **send_kwargs)
+            CircuitBreakerError is intentionally non-retriable here because
+            pybreaker already says the broker is unavailable.
+            """
+            return not isinstance(exception, CircuitBreakerError)
 
-                # Stage 3.2 — Success: return without exhausting remaining retries.
-                return SendAttemptResult(
-                    success=True,
-                    execution_time_seconds=time.monotonic() - start,
-                    retry_count=attempt,
-                    circuit_state=self._circuit_breaker.state,
-                )
+        def _before_sleep(retry_state: Any) -> None:
+            """Log per-attempt retry details before tenacity sleeps."""
+            next_sleep_seconds = (
+                retry_state.next_action.sleep if retry_state.next_action is not None else 0.0
+            )
+            failure = retry_state.outcome.exception() if retry_state.outcome is not None else None
+            logger.warning(
+                "Send attempt %d/%d failed for service=%s, topic=%s - retrying in %.2fs. Error: %s",
+                retry_state.attempt_number,
+                self.config.max_retries + 1,
+                self.service_name,
+                topic,
+                next_sleep_seconds,
+                failure,
+            )
 
-            except Exception as exc:
-                # Stage 3.3 — Failure: log, apply backoff, then retry or give up.
-                last_error = exc
-                if attempt < self.config.max_retries:
-                    logger.warning(
-                        "Send attempt %d/%d failed for service=%s, topic=%s — "
-                        "retrying in %.2fs.  Error: %s",
-                        attempt + 1,
-                        self.config.max_retries + 1,
-                        self.service_name,
-                        topic,
-                        delay,
-                        exc,
+        retry_controller = Retrying(
+            stop=stop_after_attempt(self.config.max_retries + 1),
+            wait=wait_exponential(
+                multiplier=self.config.initial_retry_delay_seconds,
+                exp_base=self.config.retry_backoff_multiplier,
+                min=self.config.initial_retry_delay_seconds,
+                max=self.config.max_retry_delay_seconds,
+            ),
+            retry=retry_if_exception(_should_retry_exception),
+            before_sleep=_before_sleep,
+            reraise=True,
+        )
+
+        try:
+            for attempt in retry_controller:
+                attempt_number = attempt.retry_state.attempt_number
+                with attempt:
+                    # Stage 3.1.1:
+                    # Force broker confirmation for each send attempt so success means
+                    # broker-acknowledged delivery, not just local queueing.
+                    send_kwargs = dict(kwargs)
+                    send_kwargs["require_delivery_confirmation"] = True
+                    send_kwargs["delivery_timeout_seconds"] = (
+                        self.config.delivery_confirmation_timeout_seconds
                     )
-                    time.sleep(delay)
-                    # Exponential growth, capped at max_retry_delay_seconds.
-                    delay = min(
-                        delay * self.config.retry_backoff_multiplier,
-                        self.config.max_retry_delay_seconds,
-                    )
-                else:
-                    logger.error(
-                        "All %d send attempts exhausted for service=%s, topic=%s.  Final error: %s",
-                        self.config.max_retries + 1,
-                        self.service_name,
-                        topic,
-                        exc,
-                    )
+
+                    def _protected_send() -> None:
+                        """Single broker-facing operation protected by pybreaker."""
+                        if routing_metadata is not None:
+                            self._routing_producer.send_with_metadata(
+                                data, routing_metadata, **send_kwargs
+                            )
+                        else:
+                            self._routing_producer.send_to_topic(topic, data, **send_kwargs)
+
+                    self._circuit_breaker.call(_protected_send)
+
+        except Exception as exc:
+            last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            logger.error(
+                "Send failed after %d/%d attempts for service=%s, topic=%s. Final error: %s",
+                attempt_number if attempt_number > 0 else 1,
+                self.config.max_retries + 1,
+                self.service_name,
+                topic,
+                last_error,
+            )
+            return SendAttemptResult(
+                success=False,
+                error=last_error,
+                execution_time_seconds=time.monotonic() - start,
+                retry_count=max(0, (attempt_number if attempt_number > 0 else 1) - 1),
+                circuit_state=self._circuit_breaker.state,
+            )
 
         return SendAttemptResult(
-            success=False,
-            error=last_error,
+            success=True,
             execution_time_seconds=time.monotonic() - start,
-            retry_count=self.config.max_retries,
+            retry_count=max(0, attempt_number - 1),
             circuit_state=self._circuit_breaker.state,
         )
 

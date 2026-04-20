@@ -395,15 +395,15 @@ in the source maps directly to a box in this diagram.
   ┌──────────────────────────────────────────────────────────┐
   │  Stage 4.0  RECORD OUTCOME                               │
   │                                                          │
-  │  success → circuit_breaker.record_success()              │
-  │    CLOSED: decay failure_count by 1                      │
-  │    HALF_OPEN: increment success_count;                   │
-  │              close circuit if threshold met              │
+  │  success → pybreaker protected-call success              │
+  │    CLOSED/HALF_OPEN transitions managed by pybreaker     │
+  │    success_threshold controls HALF_OPEN -> CLOSED        │
   │                                                          │
-  │  failure → circuit_breaker.record_failure()              │
-  │    CLOSED: increment failure_count;                      │
-  │            open circuit if threshold met                 │
-  │    HALF_OPEN: reopen circuit immediately                 │
+  │                                                          │
+  │  failure → pybreaker protected-call failure              │
+  │    fail_counter increments; OPEN at fail_max             │
+  │    HALF_OPEN failures reopen immediately                 │
+  │                                                          │
   │                                                          │
   │  In both cases: health_monitor.record_operation(...)     │
   │                                                          │
@@ -475,8 +475,8 @@ giving the broker progressively more recovery time.
 
 **What triggers OPEN state?**
 
-Five consecutive failures (default `failure_threshold=5`). Each `record_failure()` increments
-a counter. When the counter exceeds the threshold, the state transitions to OPEN.
+Five consecutive protected-call failures (default `failure_threshold=5`) trigger OPEN.
+The pybreaker fail counter tracks these transitions under the configured `fail_max`.
 
 **What counts as a failure?**
 
@@ -484,11 +484,11 @@ Any exception raised by the routing producer — `confluent_kafka.KafkaException
 timeouts, unknown topic errors, broker unavailable errors, and any other exception that
 escapes the retry loop.
 
-**Why does `can_execute()` trigger the HALF_OPEN transition?**
+**How does HALF_OPEN probing work now?**
 
-There is no background watchdog thread. The circuit is lazy — it only checks the timeout
-when a send is attempted. This is by design: it avoids a separate thread that needs lifecycle
-management. The first send attempt after `recovery_timeout_seconds` elapses acts as the probe.
+There is no background watchdog thread. The circuit remains lazy: the first send attempt
+after `recovery_timeout_seconds` elapses becomes the probe. pybreaker enforces the
+OPEN/HALF_OPEN/CLOSED state transitions during protected calls.
 
 **Production tip:** If you need the circuit to recover faster after a broker is manually repaired,
 call `producer.reset_circuit_breaker()`. This is the administrative reset path that forces
@@ -990,28 +990,28 @@ Every service that uses the DLQ producer needs a replay plan:
 Never replay from DLQ without first fixing the root cause. Replaying into a broken pipeline
 just re-populates the DLQ.
 
-### Step 6: Use battle-tested libraries when you want less custom resilience logic
+### Step 6: Battle-tested libraries in this implementation
 
 Yes, this design can be implemented with industry-standard Python libraries.
 
-Recommended mapping:
+Current library mapping:
 
 | Concern | Current implementation | Library-backed option |
 |---|---|---|
-| Circuit breaker | `CircuitBreaker` in `core.py` | [`pybreaker`](https://github.com/danielfm/pybreaker) |
-| Retry/backoff | `_execute_with_retry` loop | [`tenacity`](https://github.com/jd/tenacity) |
-| Bulkhead | `threading.Semaphore` wrapper | `threading.BoundedSemaphore` (stdlib, production-grade) |
-| Health metrics | Sliding deque in `SlidingWindowHealthMonitor` | `prometheus-client` counters/histograms + alerting rules |
+| Circuit breaker | `CircuitBreaker` wrapper over `pybreaker` | [`pybreaker`](https://github.com/danielfm/pybreaker) |
+| Retry/backoff | `_execute_with_retry` powered by tenacity `Retrying` | [`tenacity`](https://github.com/jd/tenacity) |
+| Bulkhead | `threading.BoundedSemaphore` wrapper | `threading.BoundedSemaphore` (stdlib, production-grade) |
+| Health metrics | Sliding deque in `SlidingWindowHealthMonitor` | Keep current in-process snapshot model (no Prometheus in this learning-focused scope) |
 
-Practical migration plan:
+Current scope notes:
 
-1. Replace circuit state transitions with `pybreaker.CircuitBreaker` while preserving
+1. Circuit transitions now run through `pybreaker.CircuitBreaker` while preserving
    current `SendAttemptResult` fields.
-2. Move retry logic to `tenacity` with explicit `stop_after_attempt` and
+2. Retry logic now runs through `tenacity` with explicit `stop_after_attempt` and
    `wait_exponential` settings derived from `FaultToleranceConfig`.
-3. Keep bulkhead behavior with `BoundedSemaphore` unless you move to an async runtime.
-4. Export health as metrics (`prometheus-client`) and keep result objects for caller ergonomics.
-5. Roll out behind a feature flag and compare success/error/latency distributions in staging.
+3. Bulkhead now uses `threading.BoundedSemaphore` for bounded release safety.
+4. Prometheus integration is intentionally out of scope in this iteration; `health_status()` remains the learning-friendly API.
+5. No feature flag is used; this repo defaults to the library-backed path.
 
 ---
 
@@ -1191,3 +1191,4 @@ A good learning sequence after this:
 2. Add metrics export (Prometheus/Datadog) from `health_status()` output.
 3. Explore Kafka Streams' built-in DLQ support in `DeadLetterPublishingRecoverer`.
 4. Study transactional producers for exactly-once semantics across multiple topics.
+

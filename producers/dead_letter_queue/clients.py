@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from ..content_based_router.clients import SingletonProducerGateway
+from ..content_based_router.core import ContentBasedRouter
 from ..singleton.singleton_producer import SingletonProducer
-from ..topic_routing.topic_routing_producer import TopicRoutingProducer
 
 try:
     from config.kafka_config import Environment, get_producer_config
@@ -43,9 +44,10 @@ def default_underlying_producer_factory(
 def default_routing_producer_factory(
     service_name: str,
     underlying_producer: Optional[SingletonProducer] = None,
-) -> TopicRoutingProducer:
-    """Create a topic-routing producer scoped to the given service."""
-    return TopicRoutingProducer(
+) -> ContentBasedRouter:
+    """Create a content-based router scoped to the given service."""
+    dispatcher = SingletonProducerGateway(underlying_producer) if underlying_producer else None
+    return ContentBasedRouter(
         service_name=service_name,
-        producer=underlying_producer,
+        dispatcher=dispatcher,
     )
