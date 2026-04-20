@@ -327,7 +327,9 @@ producers/content_based_router/
 │                      KafkaMessageDispatcher Protocol.
 ├── clients.py      ← SingletonProducerGateway adapter + build_singleton_dispatcher() factory.
 ├── core.py         ← All routing logic: RoutingRule ABC, three concrete rules, ContentBasedRouter.
-└── demo.py         ← Educational entrypoint: walks through all four routing strategies.
+├── demo.py         ← Educational walkthrough of all routing strategies.
+├── __main__.py     ← Package CLI entrypoint for `python -m producers.content_based_router`.
+└── README.md       ← This document.
 ```
 
 ### Why separate these files at all?
@@ -1106,6 +1108,10 @@ Kafka UI will be available at [http://localhost:8080](http://localhost:8080).
 ### Run the Content-Based Router demo
 
 ```bash
+# Recommended package entrypoint (new)
+python -m producers.content_based_router
+
+# Equivalent legacy module path
 python -m producers.content_based_router.demo
 ```
 
@@ -1273,7 +1279,7 @@ understood it, you can now study the patterns that depend on it:
 1. Read `callback_confirmed/README.md` and run its demo — this is the foundational pattern.
 2. Read `singleton/singleton_producer.py` — understand why one shared producer instance matters.
 3. Study this package completely: read `types.py` → `constants.py` → `clients.py` → `core.py`.
-4. Run the demo (`python -m producers.content_based_router.demo`) with and without a broker.
+4. Run the demo (`python -m producers.content_based_router`) with and without a broker.
 5. Write a custom routing rule following the pattern in section 8.5.
 6. Move to `dead_letter_queue/` — observe how it depends on `ContentBasedRouter` for routing
    messages to the DLQ topic.

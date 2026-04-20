@@ -312,7 +312,9 @@ producers/dead_letter_queue/
 ├── clients.py           ← Factory adapters for SingletonProducer and TopicRoutingProducer.
 ├── core.py              ← CircuitBreaker, Bulkhead, SlidingWindowHealthMonitor,
 │                           DeadLetterQueueProducer. All logic lives here.
-└── demo.py              ← Annotated demo showing the pattern in action.
+├── demo.py              ← Annotated walkthrough of the DLQ pattern in action.
+├── __main__.py          ← Package CLI entrypoint for `python -m producers.dead_letter_queue`.
+└── README.md            ← This document.
 ```
 
 ### Why separate these files?
@@ -1034,6 +1036,10 @@ the broker is healthy and topics are accessible before running the demo.
 From the project root:
 
 ```bash
+# Recommended package entrypoint (new)
+python -m producers.dead_letter_queue
+
+# Equivalent legacy module path
 python -m producers.dead_letter_queue.demo
 ```
 

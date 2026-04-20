@@ -158,6 +158,7 @@ producers/fire_and_forget/
 ├── clients.py     ← confluent_kafka → kafka-python fallback factory
 ├── core.py        ← FireAndForgetProducer class + convenience functions
 ├── demo.py        ← Runnable educational demo (6 scenes)
+├── __main__.py    ← Package CLI entrypoint for `python -m producers.fire_and_forget`
 ├── __init__.py    ← Public API surface
 └── README.md      ← This file
 ```
@@ -328,11 +329,14 @@ FireAndForgetProducer.reset_instance()   # creates a fresh instance next call
 # Start a local Kafka broker (Docker Compose example)
 docker compose up -d kafka
 
-# Run the demo (6 scenes)
-python -m producers.fire_and_forget.demo
+# Run the demo (6 scenes) - recommended package entrypoint
+python -m producers.fire_and_forget
 
 # Override broker address
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python -m producers.fire_and_forget.demo
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python -m producers.fire_and_forget
+
+# Equivalent legacy module path
+python -m producers.fire_and_forget.demo
 ```
 
 **Scene 1:** Singleton property — same instance across all call sites.
