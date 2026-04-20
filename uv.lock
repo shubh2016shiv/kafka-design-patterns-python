@@ -42,11 +42,6 @@ dependencies = [
     { name = "confluent-kafka" },
     { name = "kafka-python" },
     { name = "psutil" },
-]
-
-[package.optional-dependencies]
-resilience = [
-    { name = "prometheus-client" },
     { name = "pybreaker" },
     { name = "tenacity" },
 ]
@@ -55,20 +50,9 @@ resilience = [
 requires-dist = [
     { name = "confluent-kafka", specifier = ">=2.6.0" },
     { name = "kafka-python", specifier = ">=2.0.2" },
-    { name = "prometheus-client", marker = "extra == 'resilience'", specifier = ">=0.20.0" },
     { name = "psutil", specifier = ">=5.9.0" },
-    { name = "pybreaker", marker = "extra == 'resilience'", specifier = ">=1.4.0" },
-    { name = "tenacity", marker = "extra == 'resilience'", specifier = ">=9.0.0" },
-]
-provides-extras = ["resilience"]
-
-[[package]]
-name = "prometheus-client"
-version = "0.25.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1b/fb/d9aa83ffe43ce1f19e557c0971d04b90561b0cfd50762aafb01968285553/prometheus_client-0.25.0.tar.gz", hash = "sha256:5e373b75c31afb3c86f1a52fa1ad470c9aace18082d39ec0d2f918d11cc9ba28", size = 86035, upload-time = "2026-04-09T19:53:42.359Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/9b/d4b1e644385499c8346fa9b622a3f030dce14cd6ef8a1871c221a17a67e7/prometheus_client-0.25.0-py3-none-any.whl", hash = "sha256:d5aec89e349a6ec230805d0df882f3807f74fd6c1a2fa86864e3c2279059fed1", size = 64154, upload-time = "2026-04-09T19:53:41.324Z" },
+    { name = "pybreaker", specifier = ">=1.4.0" },
+    { name = "tenacity", specifier = ">=9.0.0" },
 ]
 
 [[package]]
