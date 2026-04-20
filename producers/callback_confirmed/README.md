@@ -864,7 +864,7 @@ Kafka UI will be available at [http://localhost:8080](http://localhost:8080).
 From the project root:
 
 ```bash
-python -m producers.callback_confirmed_producer
+python -m producers.callback_confirmed
 ```
 
 What happens:
