@@ -37,7 +37,7 @@ For local development, the external bootstrap server is usually:
 localhost:9094
 ```
 
-Kafka UI is exposed at:
+Kafka UI is exposed at the port specified by `KAFKA_UI_PORT` in your `.env` (default is 8080):
 
 ```text
 http://localhost:8080
@@ -49,7 +49,11 @@ Run these commands from the `infrastructure/` directory.
 
 ### 1. Create `.env`
 
-```powershell
+```bash
+# Linux / macOS
+cp .env.example .env
+
+# Windows (PowerShell)
 Copy-Item .env.example .env
 ```
 
@@ -64,7 +68,7 @@ Open `.env` and set:
 
 ### 3. Start the stack
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py up
 ```
 
@@ -77,19 +81,20 @@ The script will:
 
 ### 4. Check status
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py status
 python scripts/kafka_infrastructure.py health
 ```
 
 Expected outcome:
 
-- `status` shows the containers running
+- Operations (`up`, `down`, `restart`, `status`) will output a **clean tabular summary** showing your exact endpoint connections (Host vs Docker network) and UI links, followed by the Docker container status.
 - `health` prints `healthy`
 
 ### 5. Open Kafka UI
 
-[Kafka UI](http://localhost:8080)
+[Kafka UI (Default: http://localhost:8080)](http://localhost:8080)
+*(Note: If you overrode `KAFKA_UI_PORT` in your `.env` file, use that port instead, e.g., `http://localhost:18080`)*
 
 ## How Applications Should Connect
 
@@ -121,13 +126,13 @@ bootstrap_servers = "kafka:9092"
 
 ### Show status
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py status
 ```
 
 ### Run health check
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py health
 ```
 
@@ -135,25 +140,25 @@ python scripts/kafka_infrastructure.py health
 
 Kafka broker logs:
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py logs --service kafka --lines 200
 ```
 
 Kafka UI logs:
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py logs --service kafka-ui --lines 200
 ```
 
 ### Restart the stack
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py restart
 ```
 
 ### Stop the stack
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py down
 ```
 
@@ -161,7 +166,7 @@ python scripts/kafka_infrastructure.py down
 
 This removes Kafka data volumes and is destructive:
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py down --remove-volumes
 ```
 
@@ -179,13 +184,13 @@ It validates:
 
 ### Install smoke test dependency
 
-```powershell
+```bash
 python -m pip install -r smoke_tests/requirements.txt
 ```
 
 ### Run the smoke test
 
-```powershell
+```bash
 python smoke_tests/kafka_smoke_test.py --bootstrap-servers localhost:9094
 ```
 
@@ -222,7 +227,7 @@ The most important values in `.env` for this setup are:
 
 Usually means Kafka has started at the container level but is not yet ready at the broker API level. Wait a little longer, then run:
 
-```powershell
+```bash
 python scripts/kafka_infrastructure.py health
 ```
 

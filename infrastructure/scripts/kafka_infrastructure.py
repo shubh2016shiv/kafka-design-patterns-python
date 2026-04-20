@@ -43,14 +43,18 @@ class CommandExecutionError(InfrastructureError):
 class CommandExecutor(Protocol):
     """Abstraction for command execution, enabling testability and extension."""
 
-    def run(self, command: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, command: Sequence[str], *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Execute command and return completed process."""
 
 
 class SubprocessExecutor:
     """Concrete command executor based on Python subprocess."""
 
-    def run(self, command: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, command: Sequence[str], *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             command,
             cwd=str(cwd) if cwd else None,
@@ -95,7 +99,12 @@ class HostDependencyValidator:
 class DockerComposeGateway:
     """Encapsulates Docker Compose operations behind intent-driven methods."""
 
-    def __init__(self, paths: InfrastructurePaths, executor: CommandExecutor, project_name: str = "kafka_enterprise") -> None:
+    def __init__(
+        self,
+        paths: InfrastructurePaths,
+        executor: CommandExecutor,
+        project_name: str = "kafka_enterprise",
+    ) -> None:
         self._paths = paths
         self._executor = executor
         self._project_name = project_name
@@ -215,6 +224,57 @@ class InfrastructureLifecycleManager:
         return self._compose_gateway.health_probe()
 
 
+class EnvironmentConfig:
+    """Parses and holds the environment configuration from .env file."""
+
+    def __init__(self, env_file: Path) -> None:
+        self._config: dict[str, str] = {}
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    self._config[key.strip()] = value.strip()
+
+    def get(self, key: str, default: str) -> str:
+        return self._config.get(key, default)
+
+
+class ConsoleReporter:
+    """Formats and prints infrastructure status in a professional tabular format."""
+
+    def __init__(self, config: EnvironmentConfig) -> None:
+        self._config = config
+
+    def print_summary(self, command_title: str, container_status: str | None = None) -> None:
+        """Stage 6.1 - Report Render: Output tabular summary of key infrastructure variables."""
+        ext_host = self._config.get("KAFKA_EXTERNAL_HOST", "localhost")
+        ext_port = self._config.get("KAFKA_EXTERNAL_PORT", "9094")
+        int_port = self._config.get("KAFKA_INTERNAL_PORT", "9092")
+        ui_port = self._config.get("KAFKA_UI_PORT", "8080")
+        auto_create = self._config.get("KAFKA_AUTO_CREATE_TOPICS", "false")
+        partitions = self._config.get("KAFKA_DEFAULT_PARTITIONS", "3")
+
+        line = f"+{'-' * 27}+{'-' * 50}+"
+
+        print(f"\n=== KAFKA INFRASTRUCTURE: {command_title.upper()} ===")
+        print(line)
+        print(f"| {'Component / Config':<25} | {'Connection / Value':<48} |")
+        print(line)
+        print(f"| {'Kafka External (Host)':<25} | {f'{ext_host}:{ext_port}':<48} |")
+        print(f"| {'Kafka Internal (Docker)':<25} | {f'kafka:{int_port}':<48} |")
+        print(f"| {'Kafka UI (Browser)':<25} | {f'http://localhost:{ui_port}':<48} |")
+        print(line)
+        print(f"| {'Auto Create Topics':<25} | {auto_create:<48} |")
+        print(f"| {'Default Partitions':<25} | {partitions:<48} |")
+        print(line)
+
+        if container_status:
+            print("\n[ Container Status ]")
+            print(container_status)
+        print("")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Enterprise-style Kafka infrastructure lifecycle manager for local/VM environments.",
@@ -235,7 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("health", help="Run broker health probe.")
 
     logs_parser = subparsers.add_parser("logs", help="Show logs.")
-    logs_parser.add_argument("--service", default=None, help="Optional service name (kafka or kafka-ui).")
+    logs_parser.add_argument(
+        "--service", default=None, help="Optional service name (kafka or kafka-ui)."
+    )
     logs_parser.add_argument("--lines", type=int, default=200, help="Number of log lines to print.")
 
     return parser
@@ -252,8 +314,7 @@ def resolve_paths() -> InfrastructurePaths:
     )
 
 
-def build_lifecycle_manager() -> InfrastructureLifecycleManager:
-    paths = resolve_paths()
+def build_lifecycle_manager(paths: InfrastructurePaths) -> InfrastructureLifecycleManager:
     executor = SubprocessExecutor()
     dependency_validator = HostDependencyValidator(executor=executor)
     compose_gateway = DockerComposeGateway(paths=paths, executor=executor)
@@ -267,27 +328,37 @@ def build_lifecycle_manager() -> InfrastructureLifecycleManager:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    manager = build_lifecycle_manager()
+    paths = resolve_paths()
+    manager = build_lifecycle_manager(paths)
 
     try:
         manager.prepare_environment()
         manager.validate()
 
+        env_config = EnvironmentConfig(paths.env_file)
+        reporter = ConsoleReporter(env_config)
+
         if args.command == "up":
-            print(manager.up())
-            print("Kafka infrastructure is starting. Check status/health in ~30-60 seconds.")
+            status_out = manager.up()
+            reporter.print_summary("up", status_out)
+            print(
+                "Notice: Kafka infrastructure is starting. Check status/health in ~30-60 seconds."
+            )
             return 0
 
         if args.command == "down":
-            print(manager.down(remove_volumes=args.remove_volumes))
+            status_out = manager.down(remove_volumes=args.remove_volumes)
+            reporter.print_summary("down", status_out)
             return 0
 
         if args.command == "restart":
-            print(manager.restart())
+            status_out = manager.restart()
+            reporter.print_summary("restart", status_out)
             return 0
 
         if args.command == "status":
-            print(manager.status())
+            status_out = manager.status()
+            reporter.print_summary("status", status_out)
             return 0
 
         if args.command == "logs":
