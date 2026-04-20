@@ -100,7 +100,7 @@ Before creating a commit or PR, run this sequence in order:
 1. `ruff check <phased-scope> --fix --no-cache`
 2. `ruff format <phased-scope>`
 3. `ruff check <phased-scope> --no-cache`
-4. `python -m unittest test.producer.test_simple_producer`
+4. `python -m unittest test.producer.test_callback_confirmed_producer`
 
 Default `<phased-scope>` for this repository:
 - `config common producers consumers test`
