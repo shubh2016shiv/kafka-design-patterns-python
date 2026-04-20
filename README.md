@@ -104,16 +104,15 @@ KAFKA_CONFIG = {
 - **Scaling**: Kubernetes deployment examples
 - **Disaster Recovery**: Cross-datacenter replication patterns
 
-## AI Agent + Quality Standards
+## AI Agent & Copilot Standards
 
-This repository uses a canonical agent-instruction and quality-gate setup.
+This repository uses a **Hub and Spoke** model for AI agent instructions to guarantee a single source of truth and zero rule duplication.
 
-- Canonical instructions: `AGENTS.md`
-- Tool wrappers: `AGENT.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/`
-- Setup guide: [docs/ai-agent-setup.md](docs/ai-agent-setup.md)
+- **The Hub (Single Source of Truth):** `AGENTS.md` contains all canonical engineering rules, prompt guidelines, and quality gates.
+- **The Spokes (Tool Wrappers):** Tool-specific files (like `CLAUDE.md`, `.cursorrules`, or `.github/copilot-instructions.md`) must remain strictly empty except for a pointer directing the AI to read `AGENTS.md`.
+- **Setup guide:** [docs/ai-agent-setup.md](docs/ai-agent-setup.md)
 
-Required local quality sequence before commit/PR:
-
+**Required local quality sequence before commit/PR:**
 1. `ruff check config common producers consumers test --fix --no-cache`
 2. `ruff format config common producers consumers test`
 3. `ruff check config common producers consumers test --no-cache`
