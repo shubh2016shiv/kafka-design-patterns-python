@@ -1,191 +1,203 @@
 """
-Shared contracts and result models for the fire-and-forget producer package.
+Type contracts for the fire-and-forget producer.
 
-Why this module exists:
-- make the producer contract explicit so tests can inject fakes without a live broker
-- provide immutable, typed result objects so callers log and branch on fields, not strings
-- keep core.py free of structural type definitions so each layer stays focused
+WHY A SEPARATE MODULE
+---------------------
+These are the *shapes* that flow between modules: what a producer must be able
+to do, and what a send reports back. Keeping them apart from the logic means
+`core.py` reads as behaviour, and tests can depend on the contract without
+importing the implementation.
 
-ASCII contract map:
+WHAT IS IN HERE
+---------------
+  1. KafkaProducerLike  - the small slice of a Kafka producer we actually use
+  2. DeliveryCallback   - the shape of a delivery-report callback function
+  3. ProducerFactory    - the shape of "something that builds a producer"
+  4. SendResult         - what send() reports back to the caller
 
-    Application code
-          |
-          v
-    FireAndForgetProducer  ──uses──>  KafkaProducerLike (Protocol)
-          |                                    |
-          v                                    v
-    SendResult / RetryResult          confluent_kafka.Producer
-    ProducerHealthMetrics             or KafkaPythonProducerAdapter (test/fallback)
+PLAIN-LANGUAGE TERMS
+--------------------
+Contract: the inputs, outputs, and behavior that code promises to provide.
+Type hint: a note for readers and checking tools about allowed value shapes.
+Protocol: a type contract based on available methods rather than inheritance.
+Callback: a function stored now so another component can call it later.
+Serialization: conversion of an in-memory value into transportable bytes.
 """
 
+# Postpone annotation evaluation. Recursive JSON types below can then refer to
+# themselves without requiring the type to exist earlier in the file.
 from __future__ import annotations
 
-# dataclass: lightweight immutable value objects — no Pydantic needed for
-# internal results that never cross a serialization boundary.
+# ``dataclass`` generates the result object's constructor and readable repr,
+# keeping the class focused on its meaning instead of boilerplate methods.
 from dataclasses import dataclass
 
-# Protocol: structural typing lets tests inject a FakeProducer without
-# inheriting from the real confluent_kafka.Producer C extension.
-# Callable, Optional, Dict: explicit contracts for callbacks and config maps.
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+# ``Enum`` defines a closed set of named failure reasons. A closed set is safer
+# than unrelated text strings that callers might misspell.
+from enum import Enum
+
+# Any: unavoidable values owned by the third-party Kafka library.
+# Callable: the signature of a function that can be called.
+# Protocol: an interface satisfied by matching methods, without inheritance.
+# TypeAlias: tells type checkers that a name represents a reusable type.
+from typing import Any, Callable, Protocol, TypeAlias
 
 
-# ---------------------------------------------------------------------------
-# Protocol — minimal Kafka producer contract
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 1: WHAT WE REQUIRE OF A KAFKA PRODUCER
+# ============================================================
 
 
+# Inheriting from Protocol makes this an interface for type checking; no real
+# producer object is created from this class.
 class KafkaProducerLike(Protocol):
+    """The only three producer methods this package actually calls.
+
+    WHY A PROTOCOL INSTEAD OF THE REAL `confluent_kafka.Producer` TYPE
+    -----------------------------------------------------------------
+    A Protocol says "anything with these methods will do". That gives us two
+    things for free:
+
+    1. Unit tests can pass a small fake object with these three methods and
+       run the full send path with no broker and no network. Tests stay fast
+       and deterministic.
+    2. Swapping the underlying Kafka library later requires no change here,
+       as long as the replacement offers the same three methods.
+
+    This is structural typing: nothing needs to inherit from this class. A
+    `confluent_kafka.Producer` already satisfies it without knowing it exists.
     """
-    Structural interface required by FireAndForgetProducer.
 
-    Why Protocol instead of ABC:
-    - confluent_kafka.Producer is a C extension and cannot be subclassed easily.
-    - Protocol lets FakeProducer in tests satisfy the contract purely through
-      duck typing, with no real Kafka dependency at all.
-
-    Why these three methods specifically:
-    - produce() — the only way to enqueue a message; always non-blocking.
-    - poll()    — gives librdkafka CPU time to fire queued delivery callbacks.
-    - flush()   — blocks until all messages are delivered or timeout is reached;
-                  needed for graceful shutdown and optional confirmation mode.
-    """
-
-    def produce(
-        self,
-        topic: str,
-        value: bytes,
-        key: Optional[bytes] = None,
-        headers: Optional[List[Tuple[str, bytes]]] = None,
-        callback: Optional[Callable[..., None]] = None,
-        timestamp: Optional[int] = None,
-    ) -> None:
-        """
-        Enqueue one message for asynchronous delivery.
-
-        Input contract: topic, key, value are already validated and serialized
-        by core logic before this call.
-        Output contract: returns immediately — does NOT block for broker ack.
-        """
+    def produce(self, topic: str, **kwargs: Any) -> None:
+        """Queue one message locally. Must not block on the network."""
+        # Ellipsis means a Protocol declares a method but does not implement it.
+        ...
 
     def poll(self, timeout: float) -> int:
-        """
-        Serve pending delivery callbacks from librdkafka's internal event queue.
+        """Process delivery results that have already arrived.
 
-        Why call this after produce():
-        - librdkafka accumulates delivery events internally.
-        - Without poll(), those callbacks never execute in the application thread.
-        - poll(0) is non-blocking: fires only callbacks that are already ready.
-
-        Returns the number of events processed (informational, not the queue depth).
+        Returns the number of events handled.
         """
+        # The concrete Kafka client or a test fake supplies this implementation.
+        ...
 
     def flush(self, timeout: float) -> int:
+        """Wait for queued messages to reach a final outcome.
+
+        Returns how many messages were still outstanding when it gave up
+        (0 means everything reached an outcome).
         """
-        Block until all enqueued messages drain or timeout expires.
-
-        Returns remaining queue depth — non-zero means potential message loss
-        if the process exits immediately after this call.
-        """
+        # The concrete Kafka client or a test fake supplies this implementation.
+        ...
 
 
-# ---------------------------------------------------------------------------
-# Type aliases — named contracts shared across the package
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 2: FUNCTION SHAPES
+# ============================================================
 
-# Delivery callback signature: (err_or_None, msg_or_None) → None.
-# Both confluent_kafka and the kafka-python adapter use this shape.
-DeliveryCallback = Callable[[Optional[Any], Any], None]
+# A delivery callback receives (error, message):
+#   error   - None on success, otherwise a library error object
+#   message - the delivered message, exposing topic()/partition()/offset()
+#
+# Typed as Any on both sides deliberately: these objects come from the Kafka
+# C library and have no stable Python type we can import. Strict typing
+# resumes at our own boundary, SendResult (STEP 3).
+# This alias reads as: a callback accepts an optional error plus a Kafka
+# message, performs side effects, and returns no value.
+DeliveryCallback: TypeAlias = Callable[[Any | None, Any], None]
 
-# Injectable factory used by core.py; tests supply a fake factory so no
-# real broker connection is ever opened during unit test runs.
-ProducerFactory = Callable[[Dict[str, Any]], KafkaProducerLike]
+# JSON aliases make the public payload contract explicit. Values such as
+# datetime or Decimal must be converted by the application before send().
+# A scalar is one non-container value that JSON supports directly.
+JsonScalar: TypeAlias = str | int | float | bool | None
+# A JSON value may also contain nested lists or objects. This is "recursive"
+# because JsonValue appears inside its own definition.
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+# send() intentionally accepts an object at the top level, not a bare scalar.
+JsonObject: TypeAlias = dict[str, JsonValue]
 
-# Injectable config loader; tests supply a minimal dict, real code calls
-# get_producer_config() from config.kafka_config.
-ConfigLoader = Callable[..., Dict[str, Any]]
+# ``Any`` is deliberately limited to this third-party boundary because Kafka
+# configuration values are heterogeneous and owned by confluent-kafka.
+# Kafka owns hundreds of settings with different value types, so this external
+# boundary is the one intentional use of Any in the package.
+ProducerConfig: TypeAlias = dict[str, Any]
+# A factory seam lets tests use a fake client without a broker or dependency.
+# "Factory" simply means a function whose job is to create an object.
+ProducerFactory = Callable[[ProducerConfig], KafkaProducerLike]
 
 
-# ---------------------------------------------------------------------------
-# Result dataclasses — immutable, typed operation outcomes
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 3: WHAT A SEND REPORTS BACK
+# ============================================================
 
 
-@dataclass(frozen=True)
+# Combining str and Enum produces named choices that also serialize as readable
+# strings, which is convenient for logs, JSON, and metrics.
+class SendFailureReason(str, Enum):
+    """Machine-readable reason why a message was not queued locally.
+
+    Broker delivery failures are intentionally absent: without a delivery
+    callback this pattern cannot observe them. Callers can use these values
+    for retry or load-shedding decisions without parsing a log message.
+    """
+
+    # The application already closed this instance, so it cannot accept work.
+    PRODUCER_CLOSED = "producer_closed"
+    # The in-memory holding area stayed full until our waiting budget expired.
+    QUEUE_FULL = "queue_full"
+    # The client rejected the request locally, for example due to message size.
+    CLIENT_REJECTED = "client_rejected"
+
+
+# @dataclass generates __init__, equality, and repr methods. ``frozen`` prevents
+# later mutation; ``slots`` prevents accidental undeclared attributes and uses
+# less memory when many results are created.
+@dataclass(frozen=True, slots=True)
 class SendResult:
-    """
-    Outcome of a single send() call.
+    """The outcome of one `send()` call.
 
-    Why structured instead of bool/exception:
-    - lets callers inspect topic and key alongside success/failure without
-      parsing log strings
-    - makes test assertions explicit and avoids try/except boilerplate
+    `queued=True` means the message was **accepted into the producer's local
+    in-memory queue**. It does *not* mean the broker has it, and it does not
+    mean the message will ever arrive.
+
+    That is not a limitation of this class, it is the definition of
+    fire-and-forget: we never registered a delivery callback, so nothing in
+    this process will ever learn the delivery outcome. A result object cannot
+    report information the pattern deliberately declines to collect.
+
+    If you need to know whether a message truly arrived, fire-and-forget is
+    the wrong pattern. Use `producers.callback_confirmed` instead.
+
+    The dataclass is frozen because a result describes an event that already
+    happened; changing it later would make logs and control flow disagree.
 
     Fields:
-    - topic: destination Kafka topic.
-    - message_key: routing key used for partition assignment.
-      None means the broker assigns a partition using round-robin.
-    - success: True when the message was enqueued locally without error.
-      Important: this is NOT a broker acknowledgement unless
-      require_delivery_confirmation=True was passed to send().
-    - error_message: human-readable failure reason when success is False.
+        topic:         Topic the message was addressed to.
+        message_key:   The key used, or None when no key was supplied.
+        queued:        True when the local queue accepted the message.
+        error_message: Why queueing failed, or None on success. Populated when
+                       the local queue is full or the message is malformed or
+                       oversized - never for broker-side failures, which this
+                       pattern cannot observe.
+        failure_reason: Stable local failure category, or None on success.
     """
 
+    # Record the destination so logs can identify which stream was affected.
     topic: str
-    message_key: Optional[str]
-    success: bool
-    error_message: Optional[str] = None
+    # Preserve the ordering key when present; None means no key was supplied.
+    message_key: str | None
+    # True means only that the local in-memory queue accepted the message.
+    queued: bool
+    # Human-readable detail for logs and support; code should use the enum below.
+    error_message: str | None = None
+    # Stable category that application code can safely compare against.
+    failure_reason: SendFailureReason | None = None
 
-
-@dataclass(frozen=True)
-class RetryResult:
-    """
-    Outcome of a send_with_retry() call.
-
-    Why separate from SendResult:
-    - retry introduces the concept of 'how many attempts were made' which has
-      no meaning in a single send.
-    - distinguishing "succeeded on first try" from "succeeded on attempt 3"
-      matters for SLA tracking and alerting.
-
-    Fields:
-    - topic: destination Kafka topic.
-    - message_key: partitioning key (None = round-robin).
-    - attempts_made: 1 = first attempt succeeded; N = retried N-1 times.
-    - success: True when any attempt enqueued successfully.
-    - final_error_message: last error seen; populated only when success is False.
-    """
-
-    topic: str
-    message_key: Optional[str]
-    attempts_made: int
-    success: bool
-    final_error_message: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class ProducerHealthMetrics:
-    """
-    Snapshot of the producer's cumulative operational health.
-
-    Why this exists:
-    - exposes producer state for monitoring dashboards and interview demonstrations
-    - is_healthy drives the guard in send() so a degraded producer cannot silently
-      accept new messages; callers must reset the instance or investigate first
-
-    Fields:
-    - is_healthy: False when error_rate exceeds HEALTH_ERROR_RATE_THRESHOLD.
-      Stays False until reset_instance() is called — intentionally conservative.
-    - messages_sent: cumulative successfully-delivered message count.
-    - error_count: cumulative delivery failure count.
-    - error_rate: error_count / max(messages_sent + error_count, 1), i.e. the
-      share of completed delivery callbacks that failed.
-    - sanitized_config: producer config dict with credential keys redacted;
-      safe to include in logs or structured health responses.
-    """
-
-    is_healthy: bool
-    messages_sent: int
-    error_count: int
-    error_rate: float
-    sanitized_config: Dict[str, Any]
+    # @property lets callers read ``result.retryable`` like data while this
+    # method computes the answer from failure_reason.
+    @property
+    def retryable(self) -> bool:
+        """Return whether retrying unchanged input may succeed later."""
+        # A full queue may clear as Kafka catches up. Closed and client-rejected
+        # states require a lifecycle or input/configuration change instead.
+        return self.failure_reason is SendFailureReason.QUEUE_FULL

@@ -1,52 +1,54 @@
 """
-CLI entrypoint for the fire-and-forget producer demo.
+CLI entrypoint: `python -m producers.fire_and_forget`
 
-Why this module exists:
-- provides the canonical package runner: `python -m producers.fire_and_forget`
-- mirrors callback_confirmed package-level execution ergonomics
-- keeps demo discovery simple without requiring the `.demo` suffix
+WHY THIS MODULE EXISTS
+    It makes the package runnable without having to know the `.demo` suffix.
+    Python runs `__main__.py` when you execute a package with `-m`.
 
-ASCII flow:
+WHY IT IS THIS SHORT
+    An entrypoint should only wire things together, never hold logic. All of
+    the teaching content lives in `demo.py`, and the pattern itself lives in
+    `core.py`. Logging is configured by `run_demo()` rather than here, so the
+    tutorial's own output is not drowned out by library log lines.
+
     python -m producers.fire_and_forget
         |
         v
-    Stage 1.0 configure concise educational logging
+    Stage 1.0  run_demo() from demo.py
         |
         v
-    Stage 2.0 execute run_demo() from demo.py
-        |
-        v
-    Stage 3.0 return exit code 0 on completion
+    Stage 2.0  exit code 0 on completion
 """
 
+# Postpone evaluation of type hints. This keeps annotations lightweight and
+# allows forward references without quoting every type name.
 from __future__ import annotations
 
-import logging
-
+# Import only the tutorial orchestrator; an entrypoint should not contain the
+# Kafka workflow itself.
 from .demo import run_demo
-
-logger = logging.getLogger(__name__)
 
 
 def main() -> int:
-    """
-    Run the fire-and-forget educational demo scenes.
+    """Run the fire-and-forget tutorial.
 
     Returns:
-        Exit code `0` when the demo completes successfully.
+        0 when the tutorial completes.
 
-    Failure behavior:
-        Unhandled exceptions propagate and yield non-zero process exit status,
-        preserving traceback details for troubleshooting.
+    Failure behaviour:
+        Exceptions propagate, so the traceback is preserved and the process
+        exits non-zero. That is deliberate: a broken demo should fail
+        visibly rather than report success.
     """
-    # Stage 1.0 - Configure readable top-level logging for CLI use.
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    logger.info("=== Fire-and-Forget Producer Teaching Demo ===")
-
-    # Stage 2.0 - Execute the package demo.
+    # Stage 1.0 - run the tutorial (it configures its own logging).
     run_demo()
+
+    # Stage 2.0 - signal success to the shell.
     return 0
 
 
+# Python sets ``__name__`` to ``"__main__"`` only when this file is executed,
+# not when another module imports it for testing.
 if __name__ == "__main__":
+    # Convert main()'s integer into the process exit code seen by the shell.
     raise SystemExit(main())

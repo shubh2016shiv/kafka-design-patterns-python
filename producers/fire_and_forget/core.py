@@ -1,802 +1,590 @@
 """
-Fire-and-forget Kafka producer: shared, long-lived, thread-safe application instance.
+The fire-and-forget Kafka producer.
 
-─────────────────────────────────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════════════════════
 WHAT IS FIRE-AND-FORGET?
-─────────────────────────────────────────────────────────────────────────────
-Fire-and-forget is the simplest Kafka producer delivery mode.
-The producer calls produce(), which enqueues the message in librdkafka's
-internal buffer and returns immediately — without waiting for a broker
-acknowledgement. The application moves on while the Kafka client handles
-network I/O on a background thread.
+═══════════════════════════════════════════════════════════════════════════
+Send the message, and never find out whether it arrived.
 
-Delivery outcome:  "best effort" — messages may be lost if the broker is
-                   down, the local buffer fills, or the process exits before
-                   flush() is called.
+Think of dropping a postcard into a mailbox. You let go and walk away. It
+almost certainly arrives. You get no tracking number, and if it is lost,
+nobody tells you.
 
-Use when:
-  - message loss is acceptable (metrics, analytics, non-critical events)
-  - throughput and low caller latency matter more than durability guarantees
-  - you want the simplest possible producer code path
+═══════════════════════════════════════════════════════════════════════════
+WHAT MAKES IT FIRE-AND-FORGET? (the one thing to remember)
+═══════════════════════════════════════════════════════════════════════════
+There is no configuration setting for this. There is no `fire_and_forget=True`
+flag anywhere in Kafka. The pattern is established by exactly one thing:
 
-Avoid when:
-  - every message must be accounted for (payments, orders, audit logs)
-  - you need at-least-once or exactly-once semantics
-  → use callback_confirmed or transactional_producer instead
+    producer.produce(topic, value=payload)              <-- fire-and-forget
+    producer.produce(topic, value=payload,
+                     on_delivery=callback)              <-- NOT fire-and-forget
 
-─────────────────────────────────────────────────────────────────────────────
-WHY A SHARED (SINGLETON) INSTANCE?
-─────────────────────────────────────────────────────────────────────────────
-confluent_kafka.Producer is thread-safe and designed to be created once and
-reused for the lifetime of the application. Creating a new Producer per
-request wastes TCP connections to brokers and prevents internal batching from
-working efficiently. The singleton pattern here is an *implementation detail*
-of producer lifecycle management, not a Kafka delivery guarantee.
+It is the ABSENCE of the `on_delivery=` argument. Nothing else. Same class,
+same broker, same network trip, same `acks` setting. Adding that one argument
+turns this into the callback-confirmed pattern
+(`producers.callback_confirmed`).
 
-─────────────────────────────────────────────────────────────────────────────
-ASCII FLOW — fire-and-forget send path
-─────────────────────────────────────────────────────────────────────────────
+Two things people wrongly believe control it:
 
-  Application Thread (caller)         librdkafka Background Thread
-  ────────────────────────────         ──────────────────────────────
-  Stage 1.0  validate + serialize
-        |
-        v
-  Stage 2.0  wire delivery callback
-        |
-        v
-  Stage 3.0  producer.produce()  ──→  [librdkafka internal queue]
-        |                                       |
-        v                                       |  async network I/O
-  Stage 4.0a  producer.poll(0)           [Kafka Broker]
-        |      (non-blocking:                   |
-        |       fires only ready callbacks)     |  broker ack or error
-        |                                       |
-        v                               delivery callback fires
-  caller resumes immediately             → updates health metrics
-  (does NOT wait for broker ack)         → logs topic/partition/offset
+    acks=0          No. `acks` decides how careful the BROKER is before
+                    answering. Whether YOUR CODE listens to that answer is a
+                    separate decision. This class uses acks="all" and is
+                    still fire-and-forget, because it never listens.
 
-─────────────────────────────────────────────────────────────────────────────
-OPTIONAL CONFIRMATION MODE (Stage 4.0b)
-─────────────────────────────────────────────────────────────────────────────
-When require_delivery_confirmation=True is passed to send(), the caller
-DOES wait for the delivery callback before returning. This turns the call into
-a synchronous send and sacrifices throughput for delivery certainty.
+    an "async" flag No. Every produce() call in this library is asynchronous.
+                    It returns without waiting for a delivery outcome.
 
-  Stage 4.0b  _await_delivery_confirmation()
-        |      polls in 100 ms intervals until callback fires or timeout
-        v
-  raises TimeoutError  if broker takes too long
-  raises RuntimeError  if broker rejected the message
+═══════════════════════════════════════════════════════════════════════════
+ASCII FLOW - what happens on a send
+═══════════════════════════════════════════════════════════════════════════
+
+  YOUR THREAD                        BACKGROUND THREAD (in the C library)      BROKER
+  ───────────                        ────────────────────────────────────      ──────
+  Stage 1.0  validate inputs
+       │
+       v
+  Stage 2.0  serialize to bytes
+       │
+       v
+  Stage 3.0  produce()  ──────────>  [ message waits in a local queue ]
+       │     (returns instantly;              │
+       │      touches no network)             │  started automatically; you
+       v                                      │  never call it yourself
+  Stage 4.0  return result                    v
+       │                              send batch over network ───────────>  broker stores it
+       v                                                           <───────  broker answers
+  caller resumes immediately                  │
+                                              v
+  (never waits for the broker)      [ answer waits in a report queue ]
+                                              │
+                                              │  NOBODY IS LISTENING:
+                                              │  no on_delivery callback was
+                                              │  registered, so this answer
+                                              x  is discarded, success or not
+
+  Stage 5.0  flush()  -  before shutdown: give queued messages a bounded
+                         chance to finish instead of abandoning them.
+
+═══════════════════════════════════════════════════════════════════════════
+WHEN TO USE THIS / WHEN NOT TO
+═══════════════════════════════════════════════════════════════════════════
+USE IT WHEN                              DO NOT USE IT WHEN
+  high volume, each message cheap          each message is valuable
+  losing a few is acceptable               loss must be detected or prevented
+  throughput matters above all             you must react to a failure
+  e.g. metrics, logs, clickstream,         e.g. payments, orders, sign-ups,
+       telemetry, IoT sensor pings              inventory changes, audit logs
+
+DECISION RULE
+  "If one of these messages vanished and nobody noticed, is that acceptable?"
+    yes -> fire-and-forget
+    no  -> use `producers.callback_confirmed`, which adds the one argument
+           above and turns silent loss into a reportable error.
+
+PLAIN-LANGUAGE TERMS USED IN THIS FILE
+  broker          one Kafka server
+  topic           a named stream of messages
+  partition       one ordered slice of a topic
+  local queue     memory inside this process holding work not yet finished
+  callback        a function saved now so the library can call it later
+  serialize       convert a Python value into bytes for storage or transport
+  back-pressure   the client saying "my local queue is full; slow down"
+  flush           wait for queued work to finish or for a timeout to expire
+  adapter         small code layer translating our interface to a library API
+  context manager the object used by Python's ``with`` statement for cleanup
 """
 
+# Postpone type-hint evaluation. This keeps annotations descriptive and avoids
+# importing types only to evaluate hints at runtime.
 from __future__ import annotations
 
-# atexit: registers _cleanup() so in-flight messages are flushed on exit.
-import atexit
-
-# json: standard wire format for event payloads on this topic schema.
+# json: the payload wire format. Kafka itself stores only bytes and has no
+# opinion on their structure, so we choose JSON and document it as the
+# contract for the topics this producer writes to.
 import json
 
-# logging: structured operational breadcrumbs without leaking secrets.
+# logging: operational breadcrumbs. Used instead of print() so applications
+# control routing and verbosity, and so nothing is emitted in library use.
 import logging
 
-# threading: Lock for double-checked locking; Event for delivery confirmation.
-import threading
-
-# time: monotonic clock for delivery confirmation deadline; exponential backoff.
+# time: monotonic clock for bounded waiting. monotonic() is used rather than
+# time() because it cannot jump backwards when the system clock is adjusted.
 import time
 
-# typing: explicit contracts for every public and internal boundary.
-from typing import Any, Dict, List, Optional, Tuple
+# TracebackType describes the traceback value received by a context manager's
+# __exit__ method when code inside a ``with`` block raises an exception.
+from types import TracebackType
 
+# Self means "the same class as this method's instance" and gives __enter__ an
+# accurate return type even if this class is later subclassed.
+from typing import Self
+
+# Import the default adapter that creates a real confluent-kafka producer.
 from .clients import default_producer_factory
+# Import the reviewed defaults used when callers provide no configuration.
+from .config import build_producer_config
+# Import every timing decision by name so no unexplained number appears below.
 from .constants import (
-    DEFAULT_DELIVERY_TIMEOUT_SECONDS,
     DEFAULT_FLUSH_TIMEOUT_SECONDS,
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_POLL_TIMEOUT_SECONDS,
-    DEFAULT_RETRY_DELAY_SECONDS,
-    HEALTH_ERROR_RATE_THRESHOLD,
-    HEALTH_MIN_MESSAGE_COUNT,
-    SENSITIVE_CONFIG_KEY_MARKERS,
+    DEFAULT_QUEUE_CAPACITY_WAIT_SECONDS,
+    QUEUE_CAPACITY_POLL_INTERVAL_SECONDS,
     SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
 )
+# Import data contracts rather than depending on the concrete Kafka class.
 from .types import (
-    DeliveryCallback,
+    JsonObject,
     KafkaProducerLike,
+    ProducerConfig,
     ProducerFactory,
-    ProducerHealthMetrics,
-    RetryResult,
+    SendFailureReason,
     SendResult,
 )
 
-# Primary import path for repository execution.
-try:
-    from config.kafka_config import Environment, get_producer_config
-except ImportError:  # pragma: no cover — package install fallback.
-    from kafka.config.kafka_config import Environment, get_producer_config  # type: ignore[no-redef]
-
+# Create a named logger. A logger records operational information and lets the
+# host application decide whether it goes to a file, console, or monitoring tool.
 logger = logging.getLogger("producers.fire_and_forget")
 
 
-# ---------------------------------------------------------------------------
-# FireAndForgetProducer — thread-safe shared producer instance
-# ---------------------------------------------------------------------------
-
-
 class FireAndForgetProducer:
+    """A Kafka producer that sends without ever checking the outcome.
+
+    PURPOSE
+        Give calling code a `send()` that does not wait for broker delivery, for
+        high-volume events where losing an occasional message is acceptable.
+
+    WHAT IT DELIBERATELY DOES NOT DO
+        It does not tell you whether a message arrived. No delivery callback
+        is registered anywhere in this class - that omission *is* the pattern
+        (see the module docstring). If you need delivery outcomes, use
+        `producers.callback_confirmed` instead.
+
+    LIFECYCLE - CREATE ONE, REUSE IT
+        A producer holds TCP connections to the brokers and accumulates
+        messages into batches. Creating one per message destroys both
+        benefits and leaks connections. Create one per application and share
+        it:
+
+            producer = FireAndForgetProducer()
+            try:
+                producer.send("page-views", {"user": "u-1"})
+            finally:
+                producer.close()      # ALWAYS: flushes what is still queued
+
+        Or let the context manager call `close()` for you:
+
+            with FireAndForgetProducer() as producer:
+                producer.send("page-views", {"user": "u-1"})
+
+        If you want a single shared instance enforced process-wide, use
+        `producers.singleton` instead, which adds that lifecycle management.
+
+    THREAD SAFETY
+        Safe to share across threads. The underlying client synchronises
+        internally, so no application-level locking is needed around `send()`.
+        Application shutdown must first stop worker threads from calling
+        `send()`, then call `close()` once; closing concurrently with active
+        sends creates an ambiguous lifecycle in any producer design.
     """
-    Thread-safe, application-scoped Kafka producer using fire-and-forget delivery.
 
-    Design:
-    - One instance is created on first access and reused for the entire application
-      lifecycle. This eliminates per-request TCP handshakes to brokers and lets
-      librdkafka's internal batching work as intended.
-    - Thread-safety is guaranteed by double-checked locking on _class_lock.
-      Once initialized, send() requires no locking because confluent_kafka.Producer
-      is itself thread-safe at the C-extension level.
-    - Health monitoring tracks cumulative delivery errors so operators can detect
-      broker issues without grep-ing logs.
-
-    Lifecycle:
-        # Any thread, any call site — always returns the same instance.
-        producer = FireAndForgetProducer.get_instance()
-        producer.send("page-views", {"user_id": 42, "page": "/home"})
-
-    Reset (testing only):
-        FireAndForgetProducer.reset_instance()
-
-    Graceful shutdown:
-        producer.flush()   # or let atexit handle it automatically
-    """
-
-    # Class-level singleton state — shared across all threads.
-    _instance: Optional["FireAndForgetProducer"] = None
-    _class_lock: threading.Lock = threading.Lock()
-    _initialized: bool = False
-
-    def __new__(
-        cls,
-        config: Optional[Dict[str, Any]] = None,
-        producer_factory: Optional[ProducerFactory] = None,
-    ) -> "FireAndForgetProducer":
-        """
-        Thread-safe singleton instantiation using double-checked locking.
-
-        Why double-checked locking:
-        - The outer `if` skips the lock on every call after initialization,
-          keeping the hot path lock-free for maximum throughput.
-        - The inner `if` inside the lock handles the race where two threads
-          both see _instance is None simultaneously.
-
-        Production note:
-        Python's GIL means assignment to _instance is atomic, but we still
-        use a lock to guarantee the full __init__ completes before any other
-        thread sees the instance as ready.
-        """
-        if cls._instance is None:
-            with cls._class_lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
+    # ============================================================
+    # STEP 1: CONSTRUCTION
+    # ============================================================
 
     def __init__(
         self,
-        config: Optional[Dict[str, Any]] = None,
-        producer_factory: Optional[ProducerFactory] = None,
+        config: ProducerConfig | None = None,
+        producer_factory: ProducerFactory | None = None,
+        queue_capacity_wait_seconds: float = DEFAULT_QUEUE_CAPACITY_WAIT_SECONDS,
     ) -> None:
-        """
-        Initialize the shared producer instance (runs once despite multiple __new__ calls).
+        """Create a producer and its connection pool.
 
         Args:
-            config: Optional producer config dict. If omitted, loads PRODUCTION
-                    defaults from config.kafka_config.get_producer_config().
-                    Only honoured on the *first* call — subsequent calls are no-ops.
-            producer_factory: Optional factory injected by tests so no real broker
-                              connection is opened. Defaults to default_producer_factory.
+            config: Producer settings. When None, uses
+                `config.build_producer_config()`, whose every key is explained
+                in that module.
+            producer_factory: How to build the underlying client. When None,
+                uses `clients.default_producer_factory`. Tests inject a fake
+                factory here so no broker is contacted.
+            queue_capacity_wait_seconds: How long `send()` may wait for local
+                queue capacity before dropping a message. Set 0.0 to never
+                wait (shed load immediately). See `constants.py`.
+
+        Failure behaviour:
+            Raises `ValueError` for a negative queue wait. The default adapter
+            raises `RuntimeError` when confluent-kafka is not installed and
+            `KafkaException` when configuration is invalid. An unreachable
+            broker does not normally raise here because connection is lazy;
+            that failure later remains unobserved by this pattern.
         """
-        if self._initialized:
-            return
+        # A negative duration has no useful meaning and could produce surprising
+        # deadline calculations, so reject it before creating any resources.
+        if queue_capacity_wait_seconds < 0:
+            raise ValueError("queue_capacity_wait_seconds must be zero or greater.")
 
-        with self._class_lock:
-            if self._initialized:
-                return
+        # ``is not None`` matters: an explicitly supplied empty mapping should
+        # reach the client and fail as configured, not silently gain defaults.
+        self._config: ProducerConfig = dict(
+            config if config is not None else build_producer_config()
+        )
+        # Keep the caller's overload budget for the queue-full retry loop.
+        self._queue_capacity_wait_seconds = queue_capacity_wait_seconds
+        # Use an injected factory in tests; otherwise use the real Kafka adapter.
+        factory: ProducerFactory = producer_factory or default_producer_factory
+        # Construct one long-lived client. None later means close() has run.
+        self._producer: KafkaProducerLike | None = factory(self._config)
 
-            resolved_config = config or get_producer_config(environment=Environment.PRODUCTION)
-            factory = producer_factory or default_producer_factory
-
-            self._config: Dict[str, Any] = resolved_config
-            self._producer: KafkaProducerLike = factory(resolved_config)
-            self._health_lock: threading.Lock = threading.Lock()
-
-            # Mutable health counters — updated only inside delivery callbacks,
-            # which librdkafka fires on the calling thread via poll().
-            self._is_healthy: bool = True
-            self._messages_sent: int = 0
-            self._error_count: int = 0
-
-            # Register cleanup so pending messages are flushed on process exit.
-            atexit.register(self._shutdown)
-
-            FireAndForgetProducer._initialized = True
-            logger.info(
-                "FireAndForgetProducer initialized (bootstrap: %s).",
-                resolved_config.get("bootstrap.servers", "unknown"),
-            )
-
-    # ------------------------------------------------------------------
-    # Class-level factory and lifecycle methods
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def get_instance(
-        cls,
-        config: Optional[Dict[str, Any]] = None,
-        producer_factory: Optional[ProducerFactory] = None,
-    ) -> "FireAndForgetProducer":
-        """
-        Return the shared producer instance, creating it on first call.
-
-        Args:
-            config: Only honoured on the first call; ignored on subsequent calls.
-            producer_factory: Injected by tests; ignored after first initialization.
-
-        Returns:
-            The singleton FireAndForgetProducer instance.
-        """
-        return cls(config=config, producer_factory=producer_factory)
-
-    @classmethod
-    def reset_instance(cls) -> None:
-        """
-        Tear down and discard the current singleton instance.
-
-        When to use:
-        - test isolation: call this in setUp/tearDown to start each test fresh
-        - never call this in production code; it breaks the shared-instance contract
-
-        Effect: next get_instance() call creates a brand-new producer with a fresh
-        broker connection and zeroed health counters.
-        """
-        with cls._class_lock:
-            if cls._instance is not None:
-                cls._instance._shutdown()
-            cls._instance = None
-            cls._initialized = False
-
-    # ------------------------------------------------------------------
-    # Delivery callback
-    # ------------------------------------------------------------------
-
-    def _default_delivery_callback(self, err: Optional[Any], msg: Any) -> None:
-        """
-        Default broker delivery callback — updates health metrics.
-
-        When librdkafka fires this:
-        - err is None → message reached a broker partition and was written.
-        - err is set  → delivery failed (broker timeout, topic not found, etc.).
-
-        Health degradation logic:
-        - We require HEALTH_MIN_MESSAGE_COUNT completions before evaluating rate
-          so a single early error does not permanently mark the producer unhealthy.
-        - Once unhealthy, the producer stays unhealthy until reset_instance().
-          This is intentional: force an operator action rather than silently
-          continuing to drop messages.
-        """
-        with self._health_lock:
-            if err is not None:
-                self._error_count += 1
-            else:
-                self._messages_sent += 1
-
-            total_callbacks = self._messages_sent + self._error_count
-            error_rate = self._error_count / max(total_callbacks, 1)
-            should_mark_unhealthy = (
-                total_callbacks >= HEALTH_MIN_MESSAGE_COUNT
-                and error_rate > HEALTH_ERROR_RATE_THRESHOLD
-            )
-            if should_mark_unhealthy:
-                self._is_healthy = False
-
-        if err is not None:
-            logger.error("Delivery failed: %s", err)
-            if should_mark_unhealthy:
-                logger.warning(
-                    "Producer marked unhealthy: error rate %.1f%% (%d/%d) exceeds %.1f%% threshold.",
-                    100 * error_rate,
-                    self._error_count,
-                    total_callbacks,
-                    100 * HEALTH_ERROR_RATE_THRESHOLD,
-                )
-            return
-
-        logger.debug(
-            "Delivered → topic=%s partition=%d offset=%d",
-            msg.topic(),
-            msg.partition(),
-            msg.offset(),
+        # Log only connection labels, never arbitrary configuration, because a
+        # full Kafka config may contain passwords or authentication tokens.
+        logger.info(
+            "FireAndForgetProducer ready (bootstrap.servers=%s, client.id=%s).",
+            self._config.get("bootstrap.servers", "<unset>"),
+            self._config.get("client.id", "<unset>"),
         )
 
-    # ------------------------------------------------------------------
-    # Delivery confirmation helper
-    # ------------------------------------------------------------------
-
-    def _await_delivery_confirmation(
-        self,
-        topic: str,
-        delivery_event: threading.Event,
-        delivery_state: Dict[str, Any],
-        timeout_seconds: float,
-    ) -> None:
-        """
-        Block until the delivery callback fires or the deadline expires.
-
-        Why this helper exists:
-        produce() is always asynchronous — the callback fires when librdkafka
-        receives a broker ack. To turn fire-and-forget into a synchronous send,
-        we poll in short intervals until our Event is set by the callback.
-
-        Stage 1.0  Poll in 100 ms intervals, checking the event after each poll.
-                   'remaining' prevents over-sleeping past the deadline.
-
-        Stage 2.0  If the event never fired, raise TimeoutError with the topic name
-                   so the caller can log and decide whether to retry.
-
-        Stage 3.0  If the callback itself raised an exception, re-raise it wrapped
-                   in RuntimeError so it propagates out of send().
-
-        Stage 4.0  If the broker returned a delivery error, raise RuntimeError
-                   with the error string so callers can inspect it.
-
-        Args:
-            topic: Destination topic — included in error messages for traceability.
-            delivery_event: threading.Event set by the delivery callback when done.
-            delivery_state: Dict capturing callback_error and delivery_error.
-            timeout_seconds: Maximum wall-clock seconds to wait for confirmation.
-        """
-        # Stage 1.0 — poll until delivery callback fires or deadline passes.
-        deadline = time.monotonic() + timeout_seconds
-        while not delivery_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            self._producer.poll(min(DEFAULT_POLL_INTERVAL_SECONDS, remaining))
-
-        # Stage 2.0 — timeout path.
-        if not delivery_event.is_set():
-            raise TimeoutError(
-                f"No delivery confirmation received for topic '{topic}' "
-                f"within {timeout_seconds:.1f}s. "
-                "Check broker connectivity and increase delivery_timeout_seconds if needed."
-            )
-
-        # Stage 3.0 — callback raised an exception.
-        callback_error = delivery_state.get("callback_error")
-        if callback_error is not None:
-            raise RuntimeError(
-                f"Delivery callback raised an exception for topic '{topic}': {callback_error}"
-            ) from callback_error
-
-        # Stage 4.0 — broker rejected the message.
-        delivery_error = delivery_state.get("delivery_error")
-        if delivery_error is not None:
-            raise RuntimeError(f"Broker rejected message for topic '{topic}': {delivery_error}")
-
-    # ------------------------------------------------------------------
-    # Public send API
-    # ------------------------------------------------------------------
+    # ============================================================
+    # STEP 2: SEND ONE MESSAGE
+    # ============================================================
 
     def send(
         self,
         topic: str,
-        data: Dict[str, Any],
-        key: Optional[str] = None,
-        callback: Optional[DeliveryCallback] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timestamp: Optional[int] = None,
-        require_delivery_confirmation: bool = False,
-        delivery_timeout_seconds: float = DEFAULT_DELIVERY_TIMEOUT_SECONDS,
+        data: JsonObject,
+        key: str | None = None,
     ) -> SendResult:
-        """
-        Enqueue a message for fire-and-forget delivery.
+        """Queue one message and return immediately.
 
-        Default mode (require_delivery_confirmation=False):
-        - produce() enqueues locally and returns immediately.
-        - poll(0) fires any delivery callbacks that are already ready.
-        - Caller does NOT wait for broker acknowledgement.
-        - Highest throughput; messages may be lost if the broker is unreachable.
-
-        Confirmation mode (require_delivery_confirmation=True):
-        - Same produce() call, but then polls until the delivery callback fires.
-        - Raises TimeoutError or RuntimeError on failure.
-        - Lower throughput; appropriate for critical messages that must succeed.
-
-        Stage 1.0  Health guard — refuse to send if error rate is too high.
-        Stage 2.0  Serialize payload and key to bytes.
-        Stage 3.0  Wire delivery callback chain (default or caller-supplied).
-        Stage 4.0  Call producer.produce() — always non-blocking.
-        Stage 4.0a Fire-and-forget: poll(0) and return immediately.
-        Stage 4.0b Confirmation: poll until ack or timeout.
+        Walks Stages 1.0 to 4.0 of the module-level flow diagram.
 
         Args:
-            topic: Target Kafka topic name.
-            data: Event payload — must be JSON-serializable.
-            key: Optional partition routing key. None = round-robin assignment.
-            callback: Custom delivery callback. If omitted, the default callback
-                      updates health metrics and logs the result.
-            headers: Optional Kafka message headers (string key → string value).
-            timestamp: Optional producer-side epoch-milliseconds timestamp.
-                       None = broker assigns the timestamp.
-            require_delivery_confirmation: When True, block until broker acks.
-            delivery_timeout_seconds: Max wait for confirmation (ignored when False).
+            topic: Destination topic name. Must be a non-empty string.
+            data: The payload. Must be JSON-serializable.
+            key: Optional partition key. Messages sharing a key always land
+                in the same partition, which is how Kafka preserves ordering
+                per entity (per customer, per device). Pass None when no
+                ordering is required: the client then spreads messages across
+                partitions, which batches better.
 
         Returns:
-            SendResult with success=True on enqueue success.
+            A `SendResult`. Read `SendResult.queued` carefully: True means the
+            local queue accepted the message, NOT that it was delivered. This
+            pattern cannot report delivery - see the module docstring.
 
         Raises:
-            ValueError: If topic/key/data inputs are invalid or data cannot be
-                        JSON-serialized.
-            TimeoutError: If confirmation mode times out waiting for broker ack.
-            RuntimeError: If confirmation mode receives a broker delivery error.
+            ValueError: If `topic` is not a non-empty string, if `key` is
+                supplied but blank, or if `data` is not JSON-serializable.
+                These are programming errors, raised loudly rather than
+                returned as a result, because retrying them cannot help.
+
+        Failure behaviour:
+            Returns `queued=False` with `error_message` set when the local
+            queue is full even after waiting, or when the client rejects the
+            message (for example, it exceeds the maximum message size).
+            Broker-side failures are never reported, by design.
         """
+        # --- Stage 1.0: validate inputs ------------------------------------
+        # Raised rather than returned: a blank topic is a bug in the caller,
+        # and no amount of retrying will fix it.
         if not isinstance(topic, str) or not topic.strip():
-            raise ValueError("Topic must be a non-empty string.")
+            raise ValueError("topic must be a non-empty string.")
+        # A key selects a partition (one ordered slice of a Kafka topic). If a
+        # key is supplied, blank text is almost certainly an application bug.
         if key is not None and (not isinstance(key, str) or not key.strip()):
-            raise ValueError("Message key must be a non-empty string when provided.")
+            raise ValueError("key must be a non-empty string when provided.")
+        # None usually means a forgotten payload. An empty dictionary remains
+        # valid because it may be meaningful to the topic's data contract.
+        if data is None:
+            raise ValueError("data must not be None.")
 
-        # Stage 1.0 — health guard.
-        with self._health_lock:
-            is_healthy = self._is_healthy
-
-        if not is_healthy:
+        # close() replaces the client with None. Return a structured rejection
+        # instead of attempting to call a resource that no longer exists.
+        if self._producer is None:
             return SendResult(
                 topic=topic,
                 message_key=key,
-                success=False,
-                error_message=(
-                    "Producer is in an unhealthy state (error rate too high). "
-                    "Call reset_instance() after investigating broker connectivity."
-                ),
+                queued=False,
+                failure_reason=SendFailureReason.PRODUCER_CLOSED,
+                error_message="Producer is closed. Create a new instance to send again.",
             )
 
-        # Stage 2.0 — serialize payload and key.
-        if data is None:
-            raise ValueError("Message data cannot be None.")
+        # --- Stage 2.0: serialize to bytes ---------------------------------
+        # Kafka stores bytes only, so the payload must be encoded here. A
+        # non-serializable payload is a caller bug, hence ValueError.
+        # Serialization means converting an in-memory Python value into bytes
+        # that can be stored and moved between different programs.
         try:
-            serialized_value: bytes = json.dumps(data).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Message data is not JSON-serializable: {exc}") from exc
+            # json.dumps creates text; UTF-8 encode turns that text into bytes.
+            value_bytes = json.dumps(data).encode("utf-8")
+        # TypeError covers unsupported values such as object(); ValueError
+        # covers invalid numeric data such as a disallowed circular structure.
+        except (TypeError, ValueError) as error:
+            # Chain the original error so a traceback retains the exact cause.
+            raise ValueError(f"data is not JSON-serializable: {error}") from error
 
-        serialized_key: Optional[bytes] = key.encode("utf-8") if key else None
+        # Kafka keys also travel as bytes. Keep None to request normal unkeyed
+        # partition selection when the caller does not need entity ordering.
+        key_bytes = key.encode("utf-8") if key is not None else None
 
-        kafka_headers: List[Tuple[str, bytes]] = []
-        if headers:
-            kafka_headers = [(k, v.encode("utf-8")) for k, v in headers.items()]
+        # --- Stages 3.0 and 4.0: queue it, then return local acceptance -----
+        return self._queue_message(topic, key, value_bytes, key_bytes)
 
-        # Stage 3.0 — wire callback chain.
-        # Always track delivery state so confirmation mode can inspect the outcome.
-        # The default callback always runs so health counters remain accurate even
-        # when callers provide a custom callback.
-        callback_delegate: Optional[DeliveryCallback] = callback
-        delivery_event = threading.Event()
-        delivery_state: Dict[str, Any] = {"delivery_error": None, "callback_error": None}
-
-        def _wired_callback(err: Optional[Any], msg: Any) -> None:
-            """Capture broker result, invoke the configured callback, then signal the event."""
-            delivery_state["delivery_error"] = err
-            try:
-                try:
-                    self._default_delivery_callback(err, msg)
-                except Exception as exc:  # noqa: BLE001
-                    delivery_state["callback_error"] = exc
-                    logger.exception("Default delivery callback raised for topic '%s'.", topic)
-                if (
-                    callback_delegate is not None
-                    and callback_delegate != self._default_delivery_callback
-                ):
-                    try:
-                        callback_delegate(err, msg)
-                    except Exception as exc:  # noqa: BLE001
-                        if delivery_state["callback_error"] is None:
-                            delivery_state["callback_error"] = exc
-                        logger.exception("Custom delivery callback raised for topic '%s'.", topic)
-            finally:
-                delivery_event.set()
-
-        # Stage 4.0 — enqueue message (always non-blocking).
-        produce_kwargs: Dict[str, Any] = {
-            "topic": topic,
-            "value": serialized_value,
-            "key": serialized_key,
-            "headers": kafka_headers,
-            "callback": _wired_callback,
-        }
-        if timestamp is not None:
-            produce_kwargs["timestamp"] = timestamp
-
-        try:
-            self._producer.produce(**produce_kwargs)
-        except Exception as exc:
-            logger.error("produce() failed for topic '%s': %s", topic, exc)
-            return SendResult(topic=topic, message_key=key, success=False, error_message=str(exc))
-
-        # Stage 4.0a — fire-and-forget: non-blocking poll then return.
-        if not require_delivery_confirmation:
-            self._producer.poll(DEFAULT_POLL_TIMEOUT_SECONDS)
-            return SendResult(topic=topic, message_key=key, success=True)
-
-        # Stage 4.0b — confirmation mode: wait for broker ack.
-        self._await_delivery_confirmation(
-            topic=topic,
-            delivery_event=delivery_event,
-            delivery_state=delivery_state,
-            timeout_seconds=delivery_timeout_seconds,
-        )
-        return SendResult(topic=topic, message_key=key, success=True)
-
-    def send_with_retry(
+    def _queue_message(
         self,
         topic: str,
-        data: Dict[str, Any],
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
-        key: Optional[str] = None,
-        **send_kwargs: Any,
-    ) -> RetryResult:
-        """
-        Enqueue a message with application-level exponential-backoff retry.
+        key: str | None,
+        value_bytes: bytes,
+        key_bytes: bytes | None,
+    ) -> SendResult:
+        """Hand the message to the client, waiting briefly if the queue is full.
 
-        What is being retried here:
-        This retries LOCAL enqueue failures (e.g., producer buffer full, serialization
-        error). It does NOT retry broker-level delivery failures — those are controlled
-        by the 'retries' and 'retry.backoff.ms' producer config keys.
-        Validation errors and unhealthy-producer states are treated as non-retriable
-        and fail fast because retrying cannot change those outcomes.
+        Why this is a separate method: `send()` is about validating and
+        shaping the caller's data; this is about the local queue's capacity.
+        Keeping them apart means each has one job.
 
-        Backoff schedule example with retry_delay_seconds=1.0:
-          attempt 1: immediate
-          attempt 2: wait 1 s
-          attempt 3: wait 2 s
-          attempt 4: wait 4 s
-
-        Args:
-            topic: Target Kafka topic.
-            data: Event payload (JSON-serializable dict).
-            max_retries: Maximum additional attempts after the first failure.
-                         0 means try once and give up immediately on failure.
-            retry_delay_seconds: Base delay; doubled on each subsequent attempt.
-            key: Optional partition routing key.
-            **send_kwargs: Additional keyword arguments forwarded to send().
+        Back-pressure handling:
+            When the local queue is full the client raises `BufferError`.
+            That is Kafka telling us "you are producing faster than I can
+            deliver; slow down." Following the client guidance, we call
+            `poll()` to serve pending events and give its background work time
+            to advance, then retry. A deadline prevents a stuck broker from
+            hanging the caller forever.
 
         Returns:
-            RetryResult with success=True if any attempt enqueued successfully.
+            A `SendResult` describing whether the queue accepted the message.
         """
-        last_error: str = "unknown error"
+        # send() checked the lifecycle immediately before calling this helper.
+        # The assertion documents that invariant and helps static type checkers.
+        assert self._producer is not None
 
-        for attempt in range(max_retries + 1):
+        # A monotonic deadline cannot move backward if an administrator changes
+        # the machine's wall clock while this retry loop is running.
+        deadline = time.monotonic() + self._queue_capacity_wait_seconds
+
+        # Repeat only for BufferError, which specifically means local queue
+        # capacity is temporarily exhausted.
+        while True:
+            # Client calls can fail locally, so keep the success and failure
+            # paths together around the single operation being attempted.
             try:
-                result = self.send(topic=topic, data=data, key=key, **send_kwargs)
-                if result.success:
-                    return RetryResult(
+                # Stage 3.0 - THE PATTERN ITSELF.
+                # Note what is NOT here: no `on_delivery=` argument. That
+                # single omission is what makes this fire-and-forget. With it,
+                # this would be the callback-confirmed pattern instead.
+                self._producer.produce(topic, value=value_bytes, key=key_bytes)
+
+                # Stage 4.0 - report local acceptance. No callback is
+                # registered, so this says nothing about broker delivery.
+                return SendResult(topic=topic, message_key=key, queued=True)
+
+            # BufferError is back-pressure: the application is offering work
+            # faster than the client can move it toward Kafka.
+            except BufferError:
+                # Stop retrying once the caller-approved waiting budget expires.
+                if time.monotonic() >= deadline:
+                    # Build one message used by both the log and returned result
+                    # so operators and application code see the same diagnosis.
+                    message = (
+                        f"Local queue still full after "
+                        f"{self._queue_capacity_wait_seconds:.1f}s; message dropped. "
+                        f"The producer cannot deliver as fast as this application "
+                        f"is producing."
+                    )
+                    # A warning is appropriate because data was dropped, but the
+                    # producer object itself can still accept later messages.
+                    logger.warning("send(topic=%s): %s", topic, message)
+                    # QUEUE_FULL is retryable because capacity may recover later.
+                    return SendResult(
                         topic=topic,
                         message_key=key,
-                        attempts_made=attempt + 1,
-                        success=True,
+                        queued=False,
+                        failure_reason=SendFailureReason.QUEUE_FULL,
+                        error_message=message,
                     )
-                last_error = result.error_message or "send() returned success=False"
-                with self._health_lock:
-                    producer_healthy = self._is_healthy
-                if not producer_healthy:
-                    return RetryResult(
-                        topic=topic,
-                        message_key=key,
-                        attempts_made=attempt + 1,
-                        success=False,
-                        final_error_message=last_error,
-                    )
-            except ValueError as exc:
-                last_error = str(exc)
-                return RetryResult(
+
+                # Confluent recommends polling before retrying a BufferError.
+                # Bound each poll by the remaining caller-approved wait.
+                # Never pass a negative timeout if the deadline expires between
+                # the preceding check and this calculation.
+                remaining_seconds = max(0.0, deadline - time.monotonic())
+                # Poll for at most one short slice and never beyond the total
+                # remaining budget; then the while loop tries produce() again.
+                self._producer.poll(
+                    min(QUEUE_CAPACITY_POLL_INTERVAL_SECONDS, remaining_seconds)
+                )
+
+            # The Protocol cannot name every exception from every possible
+            # adapter. This broad boundary catch converts any local client
+            # rejection into the package's stable result contract.
+            except Exception as error:  # noqa: BLE001 - boundary translation
+                # Typically an oversized message or a malformed argument.
+                # Returned rather than raised so one bad message cannot halt
+                # a bulk send loop.
+                # Do not include message data in the log; payloads may contain
+                # personal or secret information.
+                logger.error("send(topic=%s) rejected by client: %s", topic, error)
+                # CLIENT_REJECTED is not automatically retryable because an
+                # oversized or malformed message will fail the same way again.
+                return SendResult(
                     topic=topic,
                     message_key=key,
-                    attempts_made=attempt + 1,
-                    success=False,
-                    final_error_message=last_error,
+                    queued=False,
+                    failure_reason=SendFailureReason.CLIENT_REJECTED,
+                    error_message=str(error),
                 )
-            except Exception as exc:
-                last_error = str(exc)
 
-            if attempt < max_retries:
-                delay = retry_delay_seconds * (2**attempt)
-                logger.warning(
-                    "send_with_retry: attempt %d/%d failed for topic '%s' — "
-                    "retrying in %.1fs. Error: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    topic,
-                    delay,
-                    last_error,
-                )
-                time.sleep(delay)
+    # ============================================================
+    # STEP 3: SERVICE RESULTS EXPLICITLY
+    # ============================================================
 
-        logger.error(
-            "send_with_retry: all %d attempts exhausted for topic '%s'. Last error: %s",
-            max_retries + 1,
-            topic,
-            last_error,
-        )
-        return RetryResult(
-            topic=topic,
-            message_key=key,
-            attempts_made=max_retries + 1,
-            success=False,
-            final_error_message=last_error,
-        )
+    def poll(self, timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS) -> int:
+        """Process delivery results that have already arrived.
 
-    # ------------------------------------------------------------------
-    # Operational helpers
-    # ------------------------------------------------------------------
-
-    def flush(self, timeout_seconds: float = DEFAULT_FLUSH_TIMEOUT_SECONDS) -> int:
-        """
-        Block until all queued messages are delivered or timeout expires.
-
-        When to call:
-        - before application shutdown (if not using atexit)
-        - after a batch of critical messages when you need delivery assurance
-        - in integration tests to ensure all messages land before consuming
+        Fire-and-forget sends do not register delivery callbacks, so they do
+        not need a poll after every successful enqueue. This method remains
+        useful when the supplied client configuration registers other event,
+        statistics, error, or logging callbacks. Back-pressure handling also
+        polls briefly before retrying a full local queue, as recommended by
+        the client API.
 
         Args:
-            timeout_seconds: Maximum wait time in seconds.
+            timeout_seconds: How long to wait if nothing is ready yet. 0.0
+                means "handle what is ready now and return immediately".
 
         Returns:
-            Remaining queue depth after timeout — 0 means all messages delivered.
-            Negative value (-1) means the flush call itself raised an exception.
+            The number of events processed.
+
+        Failure behaviour:
+            Returns 0 when the producer is already closed.
         """
+        # Validate before checking lifecycle so a caller bug behaves the same
+        # whether the producer happens to be open or closed.
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be zero or greater.")
+        # A closed producer has no client events left for this object to serve.
+        if self._producer is None:
+            return 0
+        # Delegate callback/event processing to the concrete Kafka client.
+        return self._producer.poll(timeout_seconds)
+
+    # ============================================================
+    # STEP 4: WAIT FOR QUEUED MESSAGES (Stage 5.0)
+    # ============================================================
+
+    def flush(self, timeout_seconds: float = DEFAULT_FLUSH_TIMEOUT_SECONDS) -> int:
+        """Wait for queued messages to reach a final outcome.
+
+        Why this matters:
+            `produce()` only confirms local queueing. If the process exits
+            with work still outstanding, that work is abandoned. A flush
+            gives it time to reach either delivery or permanent failure; this
+            pattern does not reveal which outcome occurred per message.
+
+        Args:
+            timeout_seconds: Maximum time to wait before giving up.
+
+        Returns:
+            How many messages were still outstanding when it returned. 0 means
+            everything reached an outcome. A non-zero value means those
+            messages may be lost, and is logged as a warning.
+
+        Failure behaviour:
+            Returns 0 when already closed. Never raises: a failure to flush
+            is reported through the return value and the log, so shutdown
+            paths cannot be derailed by it.
+        """
+        # A negative timeout is invalid rather than a request to wait forever.
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be zero or greater.")
+        # close() already flushed and detached the client, so repeated calls are
+        # harmless and report no outstanding work.
+        if self._producer is None:
+            return 0
+
+        # Flush is a shutdown/coordination boundary. Convert client exceptions
+        # into a sentinel result so cleanup code can continue running.
         try:
-            remaining = self._producer.flush(timeout_seconds)
-            if remaining > 0:
-                logger.warning(
-                    "flush(): %d message(s) still queued after %.1fs timeout.",
-                    remaining,
-                    timeout_seconds,
-                )
-            else:
-                logger.debug("flush(): all messages delivered.")
-            return remaining
-        except Exception as exc:
-            logger.error("flush() raised an unexpected error: %s", exc)
+            # The client returns the number of messages still unresolved when
+            # the timeout expires; zero means every message reached an outcome.
+            outstanding = self._producer.flush(timeout_seconds)
+        except Exception as error:  # noqa: BLE001 - shutdown must not raise
+            # -1 cannot be confused with a real outstanding-message count.
+            logger.error("flush() failed after %.1fs: %s", timeout_seconds, error)
             return -1
 
-    def get_health_metrics(self) -> ProducerHealthMetrics:
+        # A positive count tells operators that shutdown may discard messages.
+        if outstanding > 0:
+            logger.warning(
+                "flush(): %d message(s) still unresolved after %.1fs; they may be lost.",
+                outstanding,
+                timeout_seconds,
+            )
+        # Preserve the client's count so the application may enforce its own
+        # shutdown policy or alert threshold.
+        return outstanding
+
+    # ============================================================
+    # STEP 5: SHUTDOWN
+    # ============================================================
+
+    def close(self) -> None:
+        """Flush pending messages and make this instance unusable.
+
+        Always call this before the application exits - or use the context
+        manager form, which calls it for you. It uses the dedicated,
+        platform-aware `SHUTDOWN_FLUSH_TIMEOUT_SECONDS`; shutdown is the last
+        chance for a queued message to finish before the process exits.
+
+        Safe to call more than once; later calls do nothing.
+
+        Failure behaviour:
+            Never raises. Messages that remain unresolved after the timeout
+            are logged as potentially lost rather than silently dropped.
         """
-        Return a snapshot of current producer health and delivery statistics.
-
-        Use this for:
-        - health check endpoints (Kubernetes liveness probes, etc.)
-        - operational dashboards
-        - demo and interview demonstrations of producer observability
-
-        Returns:
-            ProducerHealthMetrics with is_healthy, message counts, and
-            a secrets-redacted copy of the producer config.
-        """
-        with self._health_lock:
-            messages_sent = self._messages_sent
-            error_count = self._error_count
-            total_callbacks = messages_sent + error_count
-            error_rate = error_count / max(total_callbacks, 1)
-            is_healthy = self._is_healthy
-
-        return ProducerHealthMetrics(
-            is_healthy=is_healthy,
-            messages_sent=messages_sent,
-            error_count=error_count,
-            error_rate=error_rate,
-            sanitized_config=_sanitize_config(self._config),
-        )
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-
-    def _shutdown(self) -> None:
-        """
-        Flush pending messages and release resources.
-
-        Registered with atexit on initialization so this runs automatically
-        when the Python process exits normally. Also called by reset_instance().
-
-        Why 60 s flush timeout:
-        A generous timeout gives in-flight messages the best chance of delivery
-        before the process exits. Messages still queued after this window are
-        logged as potentially lost — not silently dropped.
-        """
-        if not hasattr(self, "_producer") or self._producer is None:
+        # Idempotent means repeated calls have the same safe effect. Returning
+        # here prevents a second close from flushing an already-detached client.
+        if self._producer is None:
             return
 
-        logger.info("FireAndForgetProducer shutting down — flushing pending messages...")
-        try:
-            remaining = self._producer.flush(SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
-            if remaining > 0:
-                logger.warning(
-                    "Shutdown: %d message(s) may be lost (not delivered within %.0fs).",
-                    remaining,
-                    SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
-                )
-            else:
-                logger.info("Shutdown: all pending messages delivered successfully.")
-        except Exception as exc:
-            logger.error("Shutdown flush raised an error: %s", exc)
-        finally:
-            self._producer = None  # type: ignore[assignment]
-            self._is_healthy = False
+        # Record the lifecycle transition without exposing configuration data.
+        logger.info("FireAndForgetProducer closing; flushing queued messages...")
+        # Use the shutdown-specific budget because the process may soon be killed
+        # by its service manager or container platform.
+        outstanding = self.flush(SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
+        # Zero means all queued work reached some final outcome before timeout.
+        if outstanding == 0:
+            logger.info("Close: all queued messages resolved.")
+        # flush() reserves -1 for an exception where the remaining count is unknown.
+        elif outstanding < 0:
+            logger.error("Close: flush failed; delivery state is unknown.")
+        # Any positive count represents messages that were still unresolved.
+        else:
+            logger.warning("Close: %d message(s) may have been lost.", outstanding)
 
+        # Detach the client even after a failed flush. This prevents later code
+        # from pretending the closed instance can safely accept new messages.
+        self._producer = None
 
-# ---------------------------------------------------------------------------
-# Config sanitization helper
-# ---------------------------------------------------------------------------
+    # ============================================================
+    # STEP 6: CONTEXT MANAGER SUPPORT
+    # ============================================================
 
+    def __enter__(self) -> Self:
+        """Allow `with FireAndForgetProducer() as producer:` usage."""
+        # A context manager returns the object bound after ``as`` in a with block.
+        return self
 
-def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return a copy of config with credential-like keys replaced by '***REDACTED***'.
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the producer on block exit, including when an error occurred.
 
-    Why this is needed:
-    producer configs can contain SASL passwords, OAuth tokens, or TLS key paths.
-    Logging them in plaintext creates a secret-leak risk in log aggregation systems.
-    """
-    return {key: "***REDACTED***" if _is_sensitive(key) else value for key, value in config.items()}
-
-
-def _is_sensitive(config_key: str) -> bool:
-    """Return True when the key name matches a known credential naming pattern."""
-    lowered = config_key.lower()
-    return any(marker in lowered for marker in SENSITIVE_CONFIG_KEY_MARKERS)
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience functions
-# ---------------------------------------------------------------------------
-
-
-def get_shared_producer(
-    config: Optional[Dict[str, Any]] = None,
-    producer_factory: Optional[ProducerFactory] = None,
-) -> FireAndForgetProducer:
-    """
-    Return the shared FireAndForgetProducer instance.
-
-    Convenience wrapper so call sites do not need to import the class directly.
-    """
-    return FireAndForgetProducer.get_instance(config=config, producer_factory=producer_factory)
-
-
-def produce_event(
-    topic: str,
-    data: Dict[str, Any],
-    **send_kwargs: Any,
-) -> SendResult:
-    """
-    One-line fire-and-forget send using the shared producer instance.
-
-    Suitable for non-critical event emission in application code where the
-    caller does not need to hold a reference to the producer itself.
-    """
-    return get_shared_producer().send(topic=topic, data=data, **send_kwargs)
-
-
-def produce_event_with_retry(
-    topic: str,
-    data: Dict[str, Any],
-    **send_kwargs: Any,
-) -> RetryResult:
-    """
-    One-line send-with-retry using the shared producer instance.
-
-    Use when local enqueue reliability matters but broker-level confirmation
-    is not required (fire-and-forget with best-effort retry on queue-full errors).
-    """
-    return get_shared_producer().send_with_retry(topic=topic, data=data, **send_kwargs)
+        This is why the context manager form is the recommended one: messages
+        are flushed even if the surrounding code raises.
+        """
+        # Always close, whether the block succeeded or raised. Returning None
+        # deliberately does not suppress the surrounding exception.
+        self.close()

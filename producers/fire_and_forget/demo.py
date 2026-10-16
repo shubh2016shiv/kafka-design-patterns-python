@@ -1,309 +1,329 @@
 """
-Educational demo for the fire-and-forget producer pattern.
+Runnable tutorial for the fire-and-forget producer.
 
-Run this script directly to see the pattern in action:
+RUN IT
+    python -m producers.fire_and_forget
 
-    python -m producers.fire_and_forget.demo
+PREREQUISITE
+    A reachable Kafka broker. For the local lab from `infrastructure/`:
+        cd infrastructure && docker compose up -d
+    Override the address with:
+        KAFKA_BOOTSTRAP_SERVERS=host:9092 python -m producers.fire_and_forget
 
-What this demo teaches:
-1. The singleton property — get_instance() always returns the same object.
-2. Fire-and-forget send — produce() returns before the broker acks.
-3. The delivery callback fires asynchronously via poll().
-4. Optional confirmation mode — blocking until the broker acks.
-5. Retry behavior — exponential backoff on local enqueue failure.
-6. Health metrics — observability built into the shared producer.
-7. Graceful shutdown — flush() drains all pending messages.
+WHAT THE FOUR SCENES TEACH
+    Scene 1  produce() returns without waiting for a delivery result
+    Scene 2  the produce -> poll -> flush lifecycle, with real timings
+    Scene 3  the payoff: throughput, measured
+    Scene 4  the honest weakness: a failure nobody is told about
 
-Prerequisites:
-- A running Kafka broker (local Docker or Confluent Cloud)
-- KAFKA_BOOTSTRAP_SERVERS env var set, or broker running on localhost:9092
+Every scene is independent and prints what it is about to do, so the output
+reads top to bottom as an explanation rather than a log dump.
 """
 
+# Postpone evaluation of type hints so tutorial annotations have no runtime cost.
 from __future__ import annotations
 
+# logging configures the severity and layout of messages emitted by the library.
 import logging
-import os
+# time supplies a steady duration clock and the current Unix timestamp.
 import time
-import threading
-from typing import Any
 
-# ---------------------------------------------------------------------------
-# Logging setup — INFO level shows the key demo events clearly
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("demo.fire_and_forget")
+# Import configuration helpers for both the working and deliberately broken clients.
+from .config import build_producer_config, read_bootstrap_servers
+# Import the behavior being demonstrated.
+from .core import FireAndForgetProducer
+# Import the precise JSON object type returned by the example-event builder.
+from .types import JsonObject
+
+# ============================================================
+# STEP 1: TUTORIAL SETTINGS
+# ============================================================
+
+# Topic used by every scene. Created automatically if the broker allows it;
+# see the note in scene 4 about why production disables that.
+DEMO_TOPIC: str = "fire-and-forget-demo"
+
+# Scene 3 sends this many messages to measure throughput. Large enough to be
+# meaningful, small enough to finish in about a second on a laptop.
+THROUGHPUT_MESSAGE_COUNT: int = 50_000
+
+# Scene 4 points a producer at a port where nothing listens, to show a
+# failure that is never reported. Kept short so the demo stays brisk.
+UNREACHABLE_BOOTSTRAP: str = "localhost:9999"
+UNREACHABLE_TIMEOUT_MS: int = 3_000
 
 
-def _read_bootstrap_servers() -> str:
+# ============================================================
+# STEP 2: OUTPUT HELPERS
+# ============================================================
+
+def announce(scene_number: int, title: str) -> None:
+    """Print a visible header so each scene's output is easy to find."""
+    # Start on a fresh line so the previous scene's final sentence does not run
+    # visually into the next heading.
+    print()
+    # Use the same fixed-width border above and below every heading.
+    print("=" * 70)
+    # Include both number and title so terminal output matches this source file.
+    print(f"SCENE {scene_number}: {title}")
+    # Close the visual heading block.
+    print("=" * 70)
+
+
+def build_example_event(event_number: int) -> JsonObject:
+    """Build one example page-view event.
+
+    Fire-and-forget suits this kind of data: high volume, and losing an
+    occasional page view does not harm anyone.
     """
-    Read bootstrap servers from the environment with a sensible local default.
-
-    Why an env var:
-    Avoids hardcoding broker addresses in source code. CI, local Docker, and
-    Confluent Cloud deployments all set this variable differently.
-    """
-    servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    logger.info("Bootstrap servers: %s", servers)
-    return servers
-
-
-def _build_demo_config(bootstrap_servers: str) -> dict:
-    """
-    Return a minimal producer config for the demo.
-
-    acks=all: broker waits for all in-sync replicas to confirm the write.
-    This is actually stricter than classic fire-and-forget (acks=0), but is
-    used here to demonstrate the delivery callback reliably in a local setup.
-
-    For true fire-and-forget with maximum throughput set acks=0 — the broker
-    will not send any acknowledgement and the delivery callback will never fire.
-    """
+    # Return a new dictionary for every message so later changes cannot mutate
+    # an event that was already handed to the producer.
     return {
-        "bootstrap.servers": bootstrap_servers,
-        "client.id": "fire-and-forget-demo",
-        "acks": "all",
-        "retries": 3,
-        "linger.ms": 5,
-        "batch.size": 16384,
-        "compression.type": "snappy",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Demo scenes
-# ---------------------------------------------------------------------------
-
-
-def scene_1_singleton_property(producer_class: Any) -> None:
-    """
-    Scene 1 — Singleton property: same object regardless of call site.
-
-    Key insight:
-    A Kafka producer maintains TCP connections to every broker in the cluster.
-    Creating a new producer per request multiplies those connections and defeats
-    librdkafka's internal batching. The shared instance avoids both problems.
-    """
-    logger.info("=" * 60)
-    logger.info("Scene 1: Singleton property")
-    logger.info("=" * 60)
-
-    instance_a = producer_class.get_instance()
-    instance_b = producer_class.get_instance()
-
-    assert instance_a is instance_b, "BUG: get_instance() returned different objects!"
-    logger.info("✓ instance_a is instance_b → %s", instance_a is instance_b)
-    logger.info("  Both variables point to id=%d", id(instance_a))
-
-
-def scene_2_fire_and_forget_send(producer_class: Any, topic: str) -> None:
-    """
-    Scene 2 — Fire-and-forget: produce() returns before the broker acks.
-
-    The delivery callback is wired internally and fires later when poll() is called.
-    The caller never blocks on broker I/O.
-    """
-    logger.info("=" * 60)
-    logger.info("Scene 2: Fire-and-forget send")
-    logger.info("=" * 60)
-
-    producer = producer_class.get_instance()
-
-    event = {
-        "event_type": "page_view",
-        "user_id": "u-1001",
-        "page": "/home",
+        "event_type": "page_view",  # Tells consumers which schema to apply.
+        "user_id": f"u-{1000 + event_number}",  # Example entity identifier.
+        "page": "/home",  # Example business data for the page-view event.
+        # Kafka and many data systems use milliseconds since 1970 for timestamps.
         "timestamp_ms": int(time.time() * 1000),
     }
 
-    logger.info("Calling send() — this returns IMMEDIATELY, no waiting for broker.")
-    t0 = time.monotonic()
-    result = producer.send(topic=topic, data=event, key="u-1001")
-    elapsed_ms = (time.monotonic() - t0) * 1000
 
-    logger.info("send() returned in %.2f ms — broker ack is still in flight.", elapsed_ms)
-    logger.info(
-        "SendResult: success=%s  topic=%s  key=%s", result.success, result.topic, result.message_key
-    )
-
-    # Give the delivery callback a moment to fire so the demo output is readable.
-    time.sleep(0.5)
+# ============================================================
+# STEP 3: SCENE 1 - produce() DOES NOT WAIT
+# ============================================================
 
 
-def scene_3_confirmation_mode(producer_class: Any, topic: str) -> None:
+def scene_1_send_returns_immediately(producer: FireAndForgetProducer) -> None:
+    """Show that send() returns without waiting for broker delivery.
+
+    The point: send() does not wait for a broker acknowledgement. The message
+    may still be local or may already be in flight when the call returns; this
+    pattern deliberately does not observe which.
     """
-    Scene 3 — Optional confirmation mode: block until the broker acks.
+    # Print what this isolated experiment is intended to prove.
+    announce(1, "send() does not wait for a delivery result")
 
-    When to use:
-    When you need to know a specific message was durably written before
-    proceeding — e.g., the last record in a batch before signalling downstream.
+    # Explain the next operation before running it, which keeps output readable
+    # even when a learner steps through the demo slowly.
+    print("Calling send() once, and timing how long it takes to return...")
+    # monotonic() measures elapsed duration safely even if the wall clock changes.
+    started = time.monotonic()
+    # Queue one keyed event. The key keeps this user's events on one partition.
+    result = producer.send(DEMO_TOPIC, build_example_event(1), key="u-1001")
+    # Convert seconds to milliseconds because this operation should be very fast.
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    # Show timing first, followed by every useful field returned to the caller.
+    print(f"  send() returned in {elapsed_ms:.3f} ms")
+    print(f"  result.queued       = {result.queued}")
+    print(f"  result.topic        = {result.topic}")
+    print(f"  result.message_key  = {result.message_key}")
+    # Add a blank line before interpreting the raw values.
+    print()
+    # These three lines make the crucial local-queue versus broker distinction.
+    print("Read result.queued carefully. True means the LOCAL QUEUE accepted the")
+    print("message. It does NOT prove that the broker stored it. The quick return")
+    print("shows that this call did not wait to learn the delivery outcome.")
+
+
+# ============================================================
+# STEP 4: SCENE 2 - THE produce -> poll -> flush LIFECYCLE
+# ============================================================
+
+
+def scene_2_lifecycle(producer: FireAndForgetProducer) -> None:
+    """Show the three calls that make up the whole pattern, and their costs.
+
+    The point: sending is instant, and `flush()` is where the waiting
+    actually happens, because that is the only call that waits for messages
+    to reach an outcome.
     """
-    logger.info("=" * 60)
-    logger.info("Scene 3: Confirmation mode (require_delivery_confirmation=True)")
-    logger.info("=" * 60)
+    # Mark the start of the lifecycle experiment.
+    announce(2, "The produce -> poll -> flush lifecycle")
 
-    producer = producer_class.get_instance()
+    # One thousand sends are enough to make timing visible without creating a
+    # long-running tutorial on an ordinary laptop.
+    message_count = 1_000
 
-    event = {
-        "event_type": "checkout_started",
-        "order_id": "ord-5001",
-        "user_id": "u-1001",
-        "timestamp_ms": int(time.time() * 1000),
-    }
+    # Stage 2.1: measure only enqueue calls; do not include the final flush yet.
+    print(f"1. Queueing {message_count:,} messages with send()...")
+    started = time.monotonic()
+    # Build and queue one independent example for each loop number.
+    for event_number in range(message_count):
+        producer.send(DEMO_TOPIC, build_example_event(event_number))
+    # Store elapsed time before printing so terminal output is not part of timing.
+    queueing_seconds = time.monotonic() - started
+    print(f"   done in {queueing_seconds:.3f}s - no waiting for the broker")
 
-    logger.info("Calling send() with require_delivery_confirmation=True.")
-    t0 = time.monotonic()
-    result = producer.send(
-        topic=topic,
-        data=event,
-        key="ord-5001",
-        require_delivery_confirmation=True,
-        delivery_timeout_seconds=10.0,
-    )
-    elapsed_ms = (time.monotonic() - t0) * 1000
+    # Stage 2.2: demonstrate a non-blocking event poll. Zero means do not wait.
+    print("2. Calling poll(0): handles results already back, returns at once...")
+    started = time.monotonic()
+    events_handled = producer.poll(0.0)
+    poll_seconds = time.monotonic() - started
+    print(f"   returned in {poll_seconds:.3f}s, handled {events_handled} event(s)")
 
-    logger.info("send() returned after %.2f ms — broker has confirmed receipt.", elapsed_ms)
-    logger.info("SendResult: success=%s", result.success)
+    # Stage 2.3: demonstrate the one call that deliberately waits for completion.
+    print("3. Calling flush(): waits for queued messages to reach an outcome...")
+    started = time.monotonic()
+    outstanding = producer.flush()
+    flush_seconds = time.monotonic() - started
+    print(f"   returned in {flush_seconds:.3f}s, {outstanding} message(s) unresolved")
+
+    # Summarize the measurements in plain language instead of expecting a new
+    # learner to infer the lesson from numbers alone.
+    print()
+    print("Notice where the time went: queueing was nearly free, and flush() is")
+    print("the only call that actually waited. That is the shape of every")
+    print("fire-and-forget workload: cheap sends, one wait at the end.")
 
 
-def scene_4_retry(producer_class: Any, topic: str) -> None:
+# ============================================================
+# STEP 5: SCENE 3 - THE PAYOFF, MEASURED
+# ============================================================
+
+
+def scene_3_throughput(producer: FireAndForgetProducer) -> None:
+    """Measure how many messages per second a single thread can send.
+
+    The point: this throughput is the entire reason to accept silent message
+    loss. Never waiting for the broker is what makes it possible.
     """
-    Scene 4 — send_with_retry: exponential backoff on local enqueue failure.
+    # Throughput means how many messages a system handles per unit of time.
+    announce(3, "The payoff: throughput")
 
-    Note: this retries LOCAL produce() errors (e.g., buffer full, producer unhealthy).
-    Broker-level delivery retries are handled by the 'retries' config key inside
-    librdkafka — a separate mechanism entirely.
+    # Time both queueing and the final flush so the result includes all work.
+    print(f"Sending {THROUGHPUT_MESSAGE_COUNT:,} messages from one thread...")
+    started = time.monotonic()
+    # Use one producer repeatedly; creating a client per message would destroy
+    # connection reuse and batching.
+    for event_number in range(THROUGHPUT_MESSAGE_COUNT):
+        producer.send(DEMO_TOPIC, build_example_event(event_number))
+    # Wait for all queued messages to reach success or permanent failure.
+    producer.flush()
+    elapsed_seconds = time.monotonic() - started
+
+    # Divide completed work by elapsed seconds to calculate messages per second.
+    messages_per_second = THROUGHPUT_MESSAGE_COUNT / elapsed_seconds
+    # Print raw duration and the easier-to-compare throughput rate.
+    print(f"  elapsed            : {elapsed_seconds:.2f}s")
+    print(f"  throughput         : {messages_per_second:,.0f} messages/second")
+    print()
+    print("Tens of thousands per second from a single Python thread, because we")
+    print("never pause to wait for the broker. Use this pattern where volume")
+    print("matters more than any individual message.")
+
+
+# ============================================================
+# STEP 6: SCENE 4 - THE HONEST WEAKNESS
+# ============================================================
+
+
+def scene_4_silent_failure() -> None:
+    """Send to an address where nothing is listening, and observe the silence.
+
+    The point: this is the defining weakness, not a bug. Because no
+    `on_delivery=` callback is registered, a guaranteed delivery failure
+    produces no per-message delivery error in this application's result.
+
+    This scene builds its own producer, deliberately misconfigured, and does
+    not touch the working one used by the other scenes.
     """
-    logger.info("=" * 60)
-    logger.info("Scene 4: send_with_retry with exponential backoff")
-    logger.info("=" * 60)
+    # Tell the learner this scene intentionally creates a failure.
+    announce(4, "The honest weakness: failure nobody is told about")
 
-    producer = producer_class.get_instance()
+    # Port 9999 is deliberately expected to have no Kafka broker listening.
+    doomed_config = build_producer_config(bootstrap_servers=UNREACHABLE_BOOTSTRAP)
+    # Shorten the client's total delivery budget so the demonstration finishes
+    # in three seconds rather than waiting for the production default.
+    doomed_config["delivery.timeout.ms"] = UNREACHABLE_TIMEOUT_MS
+    # Silence the client's own connection-error chatter so the point is clear:
+    # it is OUR code that learns nothing, even though the library notices.
+    doomed_config["log_level"] = 0
 
-    event = {
-        "event_type": "add_to_cart",
-        "product_id": "prod-9900",
-        "user_id": "u-1001",
-        "timestamp_ms": int(time.time() * 1000),
-    }
+    # State the test setup explicitly before producing the doomed message.
+    print(f"Pointing a producer at {UNREACHABLE_BOOTSTRAP}, where nothing listens.")
+    print("This message cannot possibly be delivered.")
 
-    result = producer.send_with_retry(
-        topic=topic,
-        data=event,
-        key="u-1001",
-        max_retries=2,
-        retry_delay_seconds=0.5,
-    )
+    # The context manager guarantees close(), which performs the final flush.
+    with FireAndForgetProducer(config=doomed_config) as doomed_producer:
+        # Local queueing still succeeds even though later network delivery fails.
+        result = doomed_producer.send(DEMO_TOPIC, {"event_type": "will_never_arrive"})
+        # Show that the local result contains no later broker outcome.
+        print(f"  send() reported queued = {result.queued}")
+        print(f"  send() reported error  = {result.error_message}")
+        print()
+        print("Waiting out the delivery timeout...")
 
-    logger.info(
-        "RetryResult: success=%s  attempts=%d  key=%s",
-        result.success,
-        result.attempts_made,
-        result.message_key,
-    )
-
-
-def scene_5_thread_safety(producer_class: Any, topic: str) -> None:
-    """
-    Scene 5 — Thread safety: multiple threads share one producer instance.
-
-    confluent_kafka.Producer is thread-safe at the C-extension level.
-    All threads call produce() on the same underlying librdkafka handle,
-    which manages internal synchronization. No application-level locking needed.
-    """
-    logger.info("=" * 60)
-    logger.info("Scene 5: Thread safety — 5 threads, 1 shared producer")
-    logger.info("=" * 60)
-
-    results = []
-    lock = threading.Lock()
-
-    def worker(thread_id: int) -> None:
-        producer = producer_class.get_instance()
-        result = producer.send(
-            topic=topic,
-            data={"event_type": "worker_event", "thread_id": thread_id},
-            key=f"thread-{thread_id}",
-        )
-        with lock:
-            results.append((thread_id, result.success))
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    logger.info(
-        "All threads used the same producer instance: %s", id(producer_class.get_instance())
-    )
-    for thread_id, success in sorted(results):
-        logger.info("  Thread %d → success=%s", thread_id, success)
+    # Explain the observed silence after close() has waited out the timeout.
+    print()
+    print("Our result was never told anything. No exception, no error value - the")
+    print("message was simply discarded. That is fire-and-forget BY DEFINITION,")
+    print("not a defect: we registered no delivery callback, so there was nothing")
+    print("to report the failure to.")
+    print()
+    print("Need to know about failures? Add the one argument this pattern omits:")
+    print("    producer.produce(topic, value=payload, on_delivery=callback)")
+    print("which is the callback-confirmed pattern: producers.callback_confirmed")
 
 
-def scene_6_health_metrics(producer_class: Any) -> None:
-    """
-    Scene 6 — Health metrics: observability built into the shared producer.
-
-    In production this output feeds a health check endpoint so Kubernetes
-    or your monitoring stack can detect producer degradation early.
-    """
-    logger.info("=" * 60)
-    logger.info("Scene 6: Health metrics")
-    logger.info("=" * 60)
-
-    producer = producer_class.get_instance()
-
-    # Small flush to trigger any pending delivery callbacks before reading metrics.
-    producer.flush(timeout_seconds=2.0)
-
-    metrics = producer.get_health_metrics()
-    logger.info("is_healthy      : %s", metrics.is_healthy)
-    logger.info("messages_sent   : %d", metrics.messages_sent)
-    logger.info("error_count     : %d", metrics.error_count)
-    logger.info("error_rate      : %.2f%%", metrics.error_rate * 100)
-    logger.info("config (sanitized):")
-    for key, value in metrics.sanitized_config.items():
-        logger.info("  %-30s = %s", key, value)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 7: RUN THE TUTORIAL
+# ============================================================
 
 
 def run_demo() -> None:
+    """Run all four scenes in order against a live broker.
+
+    Failure behaviour:
+        Scenes 1-3 need a reachable broker; if there is none, they report
+        queueing failures rather than crashing. Scene 4 needs no broker, as
+        being unreachable is its subject. The working producer is always
+        closed, even if a scene raises, because of the `finally` block.
     """
-    Orchestrate all demo scenes against a live Kafka broker.
+    # Configure only warnings and errors from library code. The tutorial's
+    # print statements remain the main explanation seen in the terminal.
+    logging.basicConfig(
+        level=logging.WARNING,  # WARNING: let the scenes' own prints lead
+        # Include clock time, severity, logger name, and message in each record.
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        # Keep timestamps compact because this is an interactive tutorial.
+        datefmt="%H:%M:%S",
+    )
 
-    Each scene is self-contained and teaches one aspect of the pattern.
-    Scenes run sequentially so log output is easy to follow.
-    """
-    from .core import FireAndForgetProducer
+    # Print the environment being used so connection mistakes are diagnosable.
+    print("FIRE-AND-FORGET PRODUCER - RUNNABLE TUTORIAL")
+    print(f"Broker: {read_bootstrap_servers()}")
+    print(f"Topic : {DEMO_TOPIC}")
 
-    bootstrap_servers = _read_bootstrap_servers()
-    config = _build_demo_config(bootstrap_servers)
-    topic = "fire-and-forget-demo"
-
-    # Inject config for the demo run; only honoured on the very first call.
-    FireAndForgetProducer.get_instance(config=config)
-
+    # Create one producer and reuse its connections and message batches across
+    # the three scenes that need a working broker.
+    producer = FireAndForgetProducer()
+    # finally guarantees cleanup even if any teaching scene raises an exception.
     try:
-        scene_1_singleton_property(FireAndForgetProducer)
-        scene_2_fire_and_forget_send(FireAndForgetProducer, topic)
-        scene_3_confirmation_mode(FireAndForgetProducer, topic)
-        scene_4_retry(FireAndForgetProducer, topic)
-        scene_5_thread_safety(FireAndForgetProducer, topic)
-        scene_6_health_metrics(FireAndForgetProducer)
+        # Run the learning sequence from basic behavior to measured throughput.
+        scene_1_send_returns_immediately(producer)
+        scene_2_lifecycle(producer)
+        scene_3_throughput(producer)
     finally:
-        logger.info("=" * 60)
-        logger.info("Demo complete — flushing remaining messages.")
-        FireAndForgetProducer.get_instance().flush()
-        FireAndForgetProducer.reset_instance()
+        # Always close: anything still queued would otherwise be lost, which
+        # is exactly the mistake scene 2 warns about.
+        producer.close()
+
+    # Use a separate deliberately broken client for the final failure lesson.
+    scene_4_silent_failure()
+
+    # End with a visible completion marker and the pattern's central rule.
+    print()
+    print("=" * 70)
+    print("Tutorial complete.")
+    print("=" * 70)
+    print()
+    print("THE ONE THING TO REMEMBER")
+    print("  Fire-and-forget is not a setting. It is the ABSENCE of an")
+    print("  on_delivery= callback on produce(). Nothing else distinguishes it.")
 
 
+# This guard supports ``python demo.py`` while preventing automatic execution
+# when tests import one of the scene functions.
 if __name__ == "__main__":
+    # Run the same orchestrator used by the package's __main__.py entrypoint.
     run_demo()

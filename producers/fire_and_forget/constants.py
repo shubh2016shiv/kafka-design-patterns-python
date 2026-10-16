@@ -1,97 +1,129 @@
 """
-Default values for the fire-and-forget producer.
+Tunable defaults for the fire-and-forget producer.
 
-All values are intentionally conservative for a long-lived, shared producer:
-- fail fast on health degradation
-- generous flush timeout so in-flight messages survive shutdown
-- short poll interval so callbacks are served frequently without busy-waiting
+WHY A SEPARATE MODULE
+---------------------
+Numbers scattered through code ("magic numbers") are impossible to review:
+a reader cannot tell whether `0.0` was deliberate or accidental. Collecting
+them here, each with an explanation of what it controls and when to change it,
+makes every tuning decision visible in one place.
 
-Tune these per-environment, not per-message.
+Each constant below documents three things:
+  1. WHAT IT CONTROLS  - the behaviour it changes
+  2. WHY THIS DEFAULT  - the reasoning behind the chosen value
+  3. WHEN TO TUNE IT   - the production situation that justifies changing it
+
+Plain-language terms used below:
+  poll          ask the client to run ready callbacks and housekeeping events
+  flush         wait for currently queued work to finish or time out
+  back-pressure the client saying "I am full; slow down"
+  latency       how long one operation takes
+  batch job     a finite job that processes many records and then exits
+  orchestrator  software such as Kubernetes that starts and stops services
 """
 
-# ---------------------------------------------------------------------------
-# Polling
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 1: HOW LONG poll() MAY BLOCK
+# ============================================================
 
-# poll(0) is called after every produce() to serve any delivery callbacks that
-# are already ready without blocking the caller's thread.
-# This constant documents the intent — do not increase it in the hot path.
+# WHAT IT CONTROLS
+#   The `timeout` argument passed to the underlying producer's poll().
+#   poll() runs callbacks and other client events that are ready. This package
+#   does not register per-message delivery callbacks, but custom configuration
+#   may register statistics, errors, logs, or other event callbacks.
+#
+# WHY THIS DEFAULT (0.0)
+#   0.0 means "handle whatever results are ready this instant, then return
+#   immediately; do not wait". That is the correct choice inside a hot send
+#   loop: fire-and-forget exists to avoid blocking the caller, so blocking in
+#   poll() would defeat the entire point of the pattern.
+#
+# WHEN TO TUNE IT
+#   Raise it (e.g. 0.5) only when you are deliberately waiting for capacity
+#   after the local queue reported itself full. See core.FireAndForgetProducer
+#   for where that happens.
+#
+# SAFE RANGE
+#   0.0 to 1.0 seconds. Larger values make a send loop feel unresponsive.
 DEFAULT_POLL_TIMEOUT_SECONDS: float = 0.0
 
-# When waiting for explicit delivery confirmation, poll() is called in short
-# intervals until the delivery callback fires or the deadline is reached.
-# 100 ms keeps confirmation latency low while avoiding busy-spin CPU waste.
-DEFAULT_POLL_INTERVAL_SECONDS: float = 0.1
 
-# ---------------------------------------------------------------------------
-# Delivery confirmation
-# ---------------------------------------------------------------------------
+# ============================================================
+# STEP 2: HOW LONG flush() WAITS BEFORE GIVING UP
+# ============================================================
 
-# Maximum time to wait for a broker ack when require_delivery_confirmation=True.
-# 10 s covers normal broker round-trip plus temporary leader elections.
-# Increase to 30 s+ for cross-datacenter or high-latency environments.
-DEFAULT_DELIVERY_TIMEOUT_SECONDS: float = 10.0
-
-# ---------------------------------------------------------------------------
-# Flush / shutdown
-# ---------------------------------------------------------------------------
-
-# flush() timeout used during graceful shutdown (atexit handler).
-# 60 s is generous enough to drain a full internal queue on a congested broker.
-# Messages still in queue after this window are logged as lost.
-SHUTDOWN_FLUSH_TIMEOUT_SECONDS: float = 60.0
-
-# flush() timeout for explicit caller-triggered flushes (producer.flush() API).
-# 30 s is a reasonable interactive-flush budget; adjust per SLA requirement.
+# WHAT IT CONTROLS
+#   The maximum time flush() waits for queued messages to reach a final
+#   outcome (delivered or failed) before returning anyway.
+#
+# WHY THIS DEFAULT (30.0)
+#   Long enough to absorb a brief broker hiccup or a slow network, short
+#   enough that a stuck broker cannot hang a batch job indefinitely. An
+#   unbounded wait is never correct: it converts a Kafka outage into a hung
+#   process with no diagnostics.
+#
+# WHEN TO TUNE IT
+#   Raise it for large batches where losing the tail of the batch is worse
+#   than waiting. Lower it for latency-sensitive request paths that must fail
+#   fast and shed load instead of waiting.
+#
+# SAFE RANGE
+#   1.0 to 120.0 seconds.
 DEFAULT_FLUSH_TIMEOUT_SECONDS: float = 30.0
 
-# ---------------------------------------------------------------------------
-# Retry
-# ---------------------------------------------------------------------------
 
-# Maximum number of retry attempts in send_with_retry().
-# Note: this is application-level retry on LOCAL enqueue failure, not broker retry.
-# Broker-level retries are controlled by the 'retries' and 'retry.backoff.ms'
-# producer config keys in config/kafka_config.py.
-DEFAULT_MAX_RETRIES: int = 3
+# ============================================================
+# STEP 3: HOW LONG TO WAIT AT SHUTDOWN
+# ============================================================
 
-# Initial delay between retry attempts (seconds).
-# Doubled on each subsequent attempt (exponential backoff) to avoid hammering a
-# producer queue that is full due to back-pressure from a slow broker.
-DEFAULT_RETRY_DELAY_SECONDS: float = 1.0
+# WHAT IT CONTROLS
+#   The flush timeout used specifically when closing the producer.
+#
+# WHY THIS DEFAULT (25.0)
+#   Shutdown is the last chance for any queued message to be delivered.
+#   Twenty-five seconds fits inside Kubernetes' common 30-second termination
+#   grace period and leaves time for the rest of application cleanup.
+#
+# WHEN TO TUNE IT
+#   Keep it below your orchestrator's termination grace period. A service with
+#   a shorter grace period must lower this value; a batch worker may raise it.
+#
+# SAFE RANGE
+#   5.0 to 300.0 seconds, but never above your platform's kill timeout.
+SHUTDOWN_FLUSH_TIMEOUT_SECONDS: float = 25.0
 
-# ---------------------------------------------------------------------------
-# Health monitoring
-# ---------------------------------------------------------------------------
 
-# Error rate threshold above which the producer marks itself unhealthy.
-# 10 % means: more than 1 in 10 delivery callbacks returned an error.
-# Tune down (e.g. 0.01) for payment/critical pipelines, up for logging pipelines.
-HEALTH_ERROR_RATE_THRESHOLD: float = 0.1
+# ============================================================
+# STEP 4: HOW LONG TO WAIT FOR LOCAL QUEUE CAPACITY
+# ============================================================
 
-# Minimum number of messages before the error rate is meaningful.
-# Prevents a single early failure (1/1 = 100 %) from permanently marking the
-# producer unhealthy before it has had a chance to establish a baseline.
-HEALTH_MIN_MESSAGE_COUNT: int = 10
+# WHAT IT CONTROLS
+#   When the local queue is full, the client raises BufferError. Before giving
+#   up on that message, send() serves pending client events and retries for up
+#   to this long, as recommended by the confluent-kafka API.
+#
+# WHY THIS DEFAULT (2.0)
+#   Long enough to ride out a brief burst where the application briefly
+#   outruns the network, short enough that a genuinely stuck broker cannot
+#   stall the caller. The wait is bounded on purpose: an unbounded retry loop
+#   would convert back-pressure into a hang with no diagnostics.
+#
+# WHEN TO TUNE IT
+#   Lower it (even to 0.0) in latency-critical paths that must shed load
+#   immediately rather than wait. Raise it for batch jobs where dropping a
+#   message is worse than pausing. It is also a constructor argument on
+#   FireAndForgetProducer, so it can be set per instance and in tests.
+#
+# SAFE RANGE
+#   0.0 to 30.0 seconds.
+DEFAULT_QUEUE_CAPACITY_WAIT_SECONDS: float = 2.0
 
-# ---------------------------------------------------------------------------
-# Credential scrubbing
-# ---------------------------------------------------------------------------
 
-# Config key substrings treated as sensitive for sanitized log output.
-# Covers Kafka SASL, OAuth, TLS, and generic secret naming patterns.
-SENSITIVE_CONFIG_KEY_MARKERS: tuple = (
-    "password",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
-    "private_key",
-    "privatekey",
-    "keyfile",
-    "key_file",
-    "credential",
-    "oauth",
-    "jwt",
-    "sasl.jaas.config",
-)
+# ============================================================
+# STEP 5: HOW LONG EACH BACK-PRESSURE POLL MAY WAIT
+# ============================================================
+
+# Polling in short slices lets the Kafka background thread make progress while
+# keeping the caller responsive. The final slice is shortened when less than
+# this interval remains in the total queue-capacity budget.
+QUEUE_CAPACITY_POLL_INTERVAL_SECONDS: float = 0.1

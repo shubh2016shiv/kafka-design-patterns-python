@@ -1,396 +1,278 @@
 # Fire-and-Forget Producer
 
-The simplest Kafka producer delivery mode. `produce()` enqueues the message locally
-and returns immediately — the broker acknowledgement happens in the background on
-librdkafka's internal thread. The caller never waits for broker I/O.
+**Send the message, and never find out whether it arrived.**
 
-This document assumes you have already read the `callback_confirmed` README and
-understand how `produce()`, `poll()`, and `flush()` work. Here we focus on *why*
-fire-and-forget exists, when it is the right choice, and how to manage a shared
-producer instance across the full application lifecycle.
-
----
-
-## Table of Contents
-
-1. [What Is Fire-and-Forget](#1-what-is-fire-and-forget)
-2. [The Three Kafka Delivery Modes](#2-the-three-kafka-delivery-modes)
-3. [Why a Shared (Singleton) Instance](#3-why-a-shared-singleton-instance)
-4. [Architecture — Two Threads, One Producer](#4-architecture--two-threads-one-producer)
-5. [Module Structure](#5-module-structure)
-6. [The Send Flow — Stage by Stage](#6-the-send-flow--stage-by-stage)
-7. [Optional Confirmation Mode](#7-optional-confirmation-mode)
-8. [Retry Logic](#8-retry-logic)
-9. [Health Monitoring](#9-health-monitoring)
-10. [Configuration Reference](#10-configuration-reference)
-11. [Running the Demo](#11-running-the-demo)
-12. [Interview Talking Points](#12-interview-talking-points)
-13. [What Comes Next](#13-what-comes-next)
-
----
-
-## 1. What Is Fire-and-Forget
-
-Fire-and-forget is a Kafka delivery mode where the producer enqueues a message
-in its local buffer and immediately moves on. No blocking, no waiting for the
-broker to reply.
-
-```
-Application Thread
-──────────────────────────────────────────────────────────────────
-  producer.send("page-views", {"user_id": 42})
-                      │
-                      │  produce() returns in microseconds
-                      ▼
-              [librdkafka internal buffer]
-                      │
-                      │  async network I/O (background thread)
-                      ▼
-              [Kafka Broker]   ← ack arrives later (or never)
-                      │
-                      │  delivery callback fires via poll()
-                      ▼
-              health metrics updated, offset logged
-```
-
-The application thread never blocks on broker I/O. The delivery callback
-fires when poll() is called — either the `poll(0)` call immediately after
-produce(), or the next scheduled poll cycle.
-
-**Trade-off:** maximum throughput and minimum producer-side latency, but
-message loss is possible if the broker is unreachable when the message
-expires from the buffer.
-
----
-
-## 2. The Three Kafka Delivery Modes
-
-| Mode | Waits for broker ack? | Message loss risk | Throughput |
-|---|---|---|---|
-| **Fire-and-forget** | No | Yes — possible | Highest |
-| **Callback-confirmed** | Yes (async callback) | Low (broker ack required) | High |
-| **Synchronous send** | Yes (blocks caller) | Lowest | Lowest |
-
-This module implements fire-and-forget as the default. Confirmation mode
-(blocking until the ack arrives) is available via `require_delivery_confirmation=True`
-but turns every call into a synchronous send — use sparingly.
-
----
-
-## 3. Why a Shared (Singleton) Instance
-
-Confluent's own documentation states:
-
-> *"It is generally advisable to create the producer at application startup and
-> keep it alive for the lifetime of the application."*
-
-**What happens if you create a producer per request:**
-
-```
-Request 1 → new Producer → TCP connect → produce → disconnect
-Request 2 → new Producer → TCP connect → produce → disconnect
-Request 3 → new Producer → TCP connect → produce → disconnect
-```
-
-Each `Producer()` call:
-- Opens TCP connections to every broker in the cluster
-- Performs metadata negotiation
-- Allocates internal buffers (32 MB by default)
-- Starts background threads
-
-For a service handling 1,000 requests/second this creates 1,000 broker
-connections per second — most Kafka clusters have a connection limit.
-
-**With a shared instance:**
-
-```
-Startup → one Producer → TCP connect (once, per broker)
-Request 1 ──┐
-Request 2 ──┤──→ shared producer.produce() → [internal batching] → one TCP write
-Request 3 ──┘
-```
-
-One connection pool, one background thread, full batching across all callers.
-
----
-
-## 4. Architecture — Two Threads, One Producer
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Application Process                                                │
-│                                                                     │
-│  ┌──────────────────┐    produce()     ┌─────────────────────────┐ │
-│  │  Thread A        │ ────────────────▶│                         │ │
-│  │  (any app code)  │                  │  FireAndForgetProducer  │ │
-│  └──────────────────┘                  │  (shared instance)      │ │
-│                                        │                         │ │
-│  ┌──────────────────┐    produce()     │  KafkaProducerLike      │ │
-│  │  Thread B        │ ────────────────▶│  (confluent_kafka or    │ │
-│  │  (any app code)  │                  │   kafka-python adapter) │ │
-│  └──────────────────┘                  │                         │ │
-│                                        └──────────┬──────────────┘ │
-│                                                   │                │
-│                   ┌───────────────────────────────▼──────────────┐ │
-│                   │  librdkafka internal queue + I/O thread      │ │
-│                   │  (batches messages, manages TCP connections)  │ │
-│                   └───────────────────────────────┬──────────────┘ │
-└───────────────────────────────────────────────────┼────────────────┘
-                                                    │  TCP
-                                              ┌─────▼──────┐
-                                              │ Kafka       │
-                                              │ Broker      │
-                                              └─────────────┘
-```
-
-**Thread safety:** `confluent_kafka.Producer` is thread-safe at the C-extension
-level. Multiple application threads can call `produce()` concurrently on the
-same instance without any application-level locking.
-
----
-
-## 5. Module Structure
-
-```
-producers/fire_and_forget/
-├── types.py       ← Protocols, dataclasses, type aliases (no Kafka dependency)
-├── constants.py   ← Default values for timeouts, retries, health thresholds
-├── clients.py     ← confluent_kafka → kafka-python fallback factory
-├── core.py        ← FireAndForgetProducer class + convenience functions
-├── demo.py        ← Runnable educational demo (6 scenes)
-├── __main__.py    ← Package CLI entrypoint for `python -m producers.fire_and_forget`
-├── __init__.py    ← Public API surface
-└── README.md      ← This file
-```
-
-**Dependency direction** (each layer only imports from layers above it):
-
-```
-types.py  ←  constants.py  ←  clients.py  ←  core.py  ←  demo.py
-                                                ↑
-                                          __init__.py
-```
-
-This means `types.py` never imports Kafka; you can unit-test all result
-objects without any broker installed.
-
----
-
-## 6. The Send Flow — Stage by Stage
-
-```python
-result = producer.send(topic="page-views", data={"user_id": 42})
-```
-
-### Stage 1.0 — Health guard
-
-Before touching the Kafka client, `send()` checks `is_healthy`. If the
-cumulative error rate has exceeded the threshold, the call returns a
-`SendResult(success=False)` immediately.
-
-Why: a degraded producer that silently accepts new work makes diagnosis
-harder. Failing fast forces an operator decision.
-
-### Stage 2.0 — Serialize payload and key
-
-`data` is JSON-serialized to bytes. The key is UTF-8 encoded if present.
-Kafka message headers (optional) are encoded to `[(str, bytes)]` pairs.
-
-### Stage 3.0 — Wire delivery callback
-
-A closure `_wired_callback` wraps the caller-supplied callback (or the
-default health-updating callback). It captures a `threading.Event` and
-a state dict so confirmation mode can inspect the result.
-
-### Stage 4.0 — `producer.produce()`
-
-Always non-blocking. Returns in microseconds regardless of broker state.
-
-### Stage 4.0a — Fire-and-forget: `poll(0)`
-
-`poll(0)` with a zero timeout fires only delivery callbacks that are
-*already ready* — it does not wait for new ones to arrive. The caller
-resumes immediately.
-
-```
-produce() → poll(0) → return SendResult(success=True)
-            ↑
-       fires callbacks already ready; skips ones still in flight
-```
-
-### Stage 4.0b — Confirmation mode: `_await_delivery_confirmation()`
-
-Only reached when `require_delivery_confirmation=True`. Polls in 100 ms
-intervals until the delivery event fires or the deadline passes.
-
----
-
-## 7. Optional Confirmation Mode
-
-```python
-result = producer.send(
-    topic="checkout-events",
-    data={"order_id": "ord-5001"},
-    require_delivery_confirmation=True,
-    delivery_timeout_seconds=10.0,
-)
-```
-
-**When to use:**
-- The last record in a batch before you signal a downstream service.
-- Critical messages where you want to know *right now* if delivery failed.
-
-**When NOT to use:**
-- High-throughput paths (100+ msg/s). Every call now has broker round-trip
-  latency added. Use the callback-confirmed or dead-letter-queue pattern instead.
-
-**Failure modes:**
-- `TimeoutError` — broker took longer than `delivery_timeout_seconds`.
-- `RuntimeError` — broker explicitly rejected the message (topic does not exist,
-  authorization failure, etc.).
-
----
-
-## 8. Retry Logic
-
-```python
-result = producer.send_with_retry(
-    topic="page-views",
-    data={"user_id": 42},
-    max_retries=3,
-    retry_delay_seconds=1.0,
-)
-```
-
-**What is being retried:**
-Application-level retry on *local* enqueue failures — e.g., producer buffer
-full, producer marked unhealthy. The backoff schedule is:
-
-```
-attempt 1: immediate
-attempt 2: wait 1 s
-attempt 3: wait 2 s
-attempt 4: wait 4 s
-```
-
-**What is NOT being retried here:**
-Broker-level delivery failures. Those are handled internally by librdkafka
-via the `retries` and `retry.backoff.ms` producer config keys.
-
-**Return value:** `RetryResult` — includes `attempts_made` so you can alert
-when messages consistently require retries (a sign of back-pressure).
-
----
-
-## 9. Health Monitoring
-
-```python
-metrics = producer.get_health_metrics()
-print(metrics.is_healthy)       # False when error rate > 10%
-print(metrics.messages_sent)    # cumulative delivery successes
-print(metrics.error_count)      # cumulative delivery failures
-print(metrics.error_rate)       # error_count / max(messages_sent + error_count, 1)
-print(metrics.sanitized_config) # config with passwords redacted
-```
-
-**Health degradation rule:**
-After `HEALTH_MIN_MESSAGE_COUNT` (10) total completions, if
-`error_count / (messages_sent + error_count) > HEALTH_ERROR_RATE_THRESHOLD` (10%),
-`is_healthy` is set to False and `send()` refuses new messages.
-
-**Why wait for 10 completions:**
-A single early failure out of 1 attempt gives a 100% error rate which would
-permanently kill the producer before it has had a chance to establish a baseline.
-
-**Recovery:**
-```python
-FireAndForgetProducer.reset_instance()   # creates a fresh instance next call
-```
-
----
-
-## 10. Configuration Reference
-
-| Key | Default | What it controls | When to tune |
-|---|---|---|---|
-| `DEFAULT_DELIVERY_TIMEOUT_SECONDS` | 10.0 | Max wait in confirmation mode | Increase for cross-DC deployments |
-| `DEFAULT_FLUSH_TIMEOUT_SECONDS` | 30.0 | Max flush() wait | Increase for large in-flight backlogs |
-| `SHUTDOWN_FLUSH_TIMEOUT_SECONDS` | 60.0 | atexit flush budget | Keep generous; message loss risk |
-| `DEFAULT_MAX_RETRIES` | 3 | Application-level retry count | Increase for flaky environments |
-| `DEFAULT_RETRY_DELAY_SECONDS` | 1.0 | Base retry backoff | Decrease for time-sensitive alerts |
-| `HEALTH_ERROR_RATE_THRESHOLD` | 0.10 | Error rate that triggers unhealthy | Decrease to 0.01 for payments |
-| `HEALTH_MIN_MESSAGE_COUNT` | 10 | Messages before health eval | Increase for very low-volume producers |
-
----
-
-## 11. Running the Demo
+This package is a teaching-quality implementation of one Kafka delivery mode. It assumes no prior Kafka knowledge: every term is defined the first time it appears, and every configuration value explains why it has that default and when you would change it.
 
 ```bash
-# Start a local Kafka broker (Docker Compose example)
-docker compose up -d kafka
-
-# Run the demo (6 scenes) - recommended package entrypoint
+# Run the tutorial (needs a broker; see Prerequisites below)
 python -m producers.fire_and_forget
-
-# Override broker address
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python -m producers.fire_and_forget
-
-# Equivalent legacy module path
-python -m producers.fire_and_forget.demo
 ```
 
-**Scene 1:** Singleton property — same instance across all call sites.
-**Scene 2:** Fire-and-forget send — returns in microseconds.
-**Scene 3:** Confirmation mode — blocks until broker acks.
-**Scene 4:** Retry — exponential backoff on enqueue failure.
-**Scene 5:** Thread safety — 5 threads sharing one producer.
-**Scene 6:** Health metrics — observability snapshot.
+---
+
+## Contents
+
+1. [The idea in one picture](#1-the-idea-in-one-picture)
+2. [What makes it fire-and-forget](#2-what-makes-it-fire-and-forget)
+3. [The three calls: produce, poll, flush](#3-the-three-calls-produce-poll-flush)
+4. [Quick start](#4-quick-start)
+5. [Module map: what to read, in order](#5-module-map-what-to-read-in-order)
+6. [Reading a SendResult correctly](#6-reading-a-sendresult-correctly)
+7. [When to use this, and when not to](#7-when-to-use-this-and-when-not-to)
+8. [Production checklist](#8-production-checklist)
+9. [Prerequisites and running](#9-prerequisites-and-running)
+10. [Testing](#10-testing)
+11. [Related packages](#11-related-packages)
 
 ---
 
-## 12. Interview Talking Points
+## 1. The idea in one picture
 
-**Q: What is fire-and-forget in Kafka?**
+Think of dropping a postcard into a mailbox. You let go and walk away. It almost certainly arrives. You get **no tracking number**, and if it is lost, nobody tells you.
 
-The producer calls `produce()`, which enqueues the message in librdkafka's
-internal buffer and returns immediately. The broker acknowledgement arrives
-asynchronously. The caller never blocks. Trade-off: highest throughput, but
-messages can be lost if the broker is unreachable when the buffer expires.
+```text
+  YOUR THREAD                    BACKGROUND THREAD (in the C library)      BROKER
+  ───────────                    ────────────────────────────────────      ──────
+  send()
+    │  validate + serialize
+    │
+    ├──> produce()  ──────────>  [ message waits in a local queue ]
+    │    returns instantly;                │
+    │    touches no network                │  started automatically;
+    │                                      │  you never call it yourself
+    │                                      v
+    └──> poll(0)            send batch over network ───────────────────>  broker stores it
+         handle results                                      <──────────  broker answers
+         already back                      │
+                                           v
+  caller resumes                 [ answer waits in a report queue ]
+  immediately                              │
+                                           │  NOBODY IS LISTENING: no delivery
+                                           x  callback was registered, so this
+                                              answer is discarded — success or not
 
-**Q: When should you NOT use fire-and-forget?**
+  close()  →  flush()  -  before shutdown: give queued messages a bounded
+                          chance to finish instead of abandoning them.
+```
 
-When every message must be accounted for: payments, order events, audit logs.
-Use callback-confirmed (at-least-once) or idempotent/transactional producers
-(exactly-once) for those cases.
+**Jargon, defined once:**
 
-**Q: Why not create a new Kafka producer per request?**
-
-Each `Producer()` call opens TCP connections to every broker, allocates 32 MB
-of internal buffers, and starts background threads. At high request rates this
-creates thousands of broker connections. A shared instance eliminates this
-overhead and enables librdkafka's internal batching.
-
-**Q: Is the shared producer thread-safe?**
-
-Yes. `confluent_kafka.Producer` is thread-safe at the C-extension level.
-Multiple threads can call `produce()` concurrently on the same instance.
-The singleton pattern here manages *lifecycle*, not thread safety.
-
-**Q: What does `poll()` do?**
-
-`poll()` gives librdkafka CPU time to fire delivery callbacks that are
-waiting in its internal event queue. Without `poll()`, callbacks would
-never execute in the application thread and the delivery event would never
-be set. `poll(0)` is non-blocking — it fires only callbacks that are already
-ready and returns immediately.
-
----
-
-## 13. What Comes Next
-
-| Pattern | Adds over fire-and-forget |
+| Term | Plain meaning |
 |---|---|
-| `callback_confirmed` | Explicit delivery verification; structured result objects |
-| `dead_letter_queue` | Circuit breaker + bulkhead + DLQ so nothing is silently dropped |
-| `idempotent_producer` | Exactly-once delivery via broker-side deduplication |
-| `transactional_producer` | Atomic writes across multiple partitions/topics |
+| **Broker** | One running Kafka server. |
+| **Topic** | A named stream of messages, like a folder name. |
+| **Partition** | One of the parallel ordered logs a topic is split into. |
+| **Asynchronous** | The call returns *before* the work is done; the work finishes later. |
+| **Delivery callback** | A function Kafka would call to report "delivered" or "failed". This pattern deliberately does not register one. |
+| **Back-pressure** | Kafka telling your code "you are producing faster than I can deliver; slow down." |
+
+---
+
+## 2. What makes it fire-and-forget
+
+**There is no configuration setting for this.** There is no `fire_and_forget=True` flag anywhere in Kafka. The pattern is established by exactly one thing:
+
+```python
+producer.produce(topic, value=payload)  # fire-and-forget
+producer.produce(topic, value=payload, on_delivery=callback)  # NOT fire-and-forget
+```
+
+It is the **absence of the `on_delivery=` argument**. Nothing else. Same class, same broker, same network trip, same `acks` setting. Adding that one argument turns this into the [callback-confirmed](../callback_confirmed/) pattern.
+
+Two things people wrongly believe control it:
+
+| Common belief | Why it is wrong |
+|---|---|
+| `acks=0` makes it fire-and-forget | `acks` decides how careful the **broker** is before answering. Whether **your code** listens to that answer is a separate decision. This package uses `acks="all"` and is still fire-and-forget, because it never listens. |
+| There is an async/sync mode flag | No. **Every** `produce()` call in this library is asynchronous. It returns without waiting for a delivery outcome. |
+
+---
+
+## 3. The three calls: produce, poll, flush
+
+The library runs **two threads**, though you only write code for one:
+
+- **Your thread** runs `produce()`, `poll()`, `flush()`, and your callbacks.
+- **A hidden background thread**, started automatically when the producer is created, does all the actual networking. You never call it.
+
+| Call | What it does |
+|---|---|
+| `produce()` | Queue the message locally and return. **Never touches the network.** That is why it is instant even when the broker is slow or dead. |
+| *(background thread)* | Actually sends the batch and receives the broker's answer — on its own schedule, with no code from you. |
+| `poll(timeout)` | Process answers that have **already arrived**, running your callback for each. It does **not** send anything and does not ask the broker for anything. `poll(0)` = "handle what is ready now, do not wait." |
+| `flush(timeout)` | Keep polling until nothing is outstanding, or the timeout expires. |
+
+**Two consequences that trip people up:**
+
+1. **`poll()` serves callbacks; the background client performs delivery.** This package does not register a delivery callback, so it does not poll after every successful send. It does poll briefly after `BufferError`, following the client guidance before retrying a full local queue. Call `poll()` yourself only if your custom configuration registers event, statistics, error, or logging callbacks.
+
+2. **Forgetting `flush()` can lose locally queued messages.** Always `close()` (or use the `with` form) before exiting. A successful flush means messages reached a final outcome, not necessarily that every message was delivered; this pattern intentionally receives no per-message report.
+
+> Note: `Producer.poll()` and `Consumer.poll()` are **different methods that share a name**. The consumer's `poll()` fetches new messages from a topic. The producer's `poll()`, described here, only processes results for messages you already sent.
+
+---
+
+## 4. Quick start
+
+```python
+from producers.fire_and_forget import FireAndForgetProducer
+
+# Recommended form: close() is called for you, even if an exception is raised.
+with FireAndForgetProducer() as producer:
+    producer.send(
+        topic="page-views",
+        data={"user_id": "u-1", "page": "/home"},
+        key="u-1",  # optional: same key -> same partition -> ordered
+    )
+```
+
+Equivalent explicit form:
+
+```python
+producer = FireAndForgetProducer()
+try:
+    producer.send("page-views", {"user_id": "u-1", "page": "/home"})
+finally:
+    producer.close()  # ALWAYS: flushes what is still queued
+```
+
+**Create one producer per application and share it.** A producer holds TCP connections to the brokers and accumulates messages into batches. Creating one per message destroys both benefits and leaks connections. It is safe to share across threads: the underlying client synchronises internally, so no locking is needed around `send()`.
+
+**About the `key` argument:** messages sharing a key always land in the same partition, which is how Kafka preserves ordering per entity (per customer, per device). Pass `None` when ordering does not matter — the client then spreads messages across partitions, which batches better.
+
+---
+
+## 5. Module map: what to read, in order
+
+| File | What it holds |
+|---|---|
+| [`constants.py`](constants.py) | Tunable defaults and the reason behind each one. |
+| [`types.py`](types.py) | The producer protocol, result object, and stable failure categories. |
+| [`config.py`](config.py) | Kafka settings, with the production tradeoff beside each decision. |
+| [`clients.py`](clients.py) | The single place the concrete Kafka library is touched. |
+| [`core.py`](core.py) | **The pattern itself.** Start with its flow diagram. |
+| [`demo.py`](demo.py) | Runnable tutorial scenes. |
+
+Flow-critical code uses `Stage n.n` markers. Imports and executable steps have nearby plain-language comments; unfamiliar Kafka and Python terms are defined where they first matter.
+
+---
+
+## 6. Reading a SendResult correctly
+
+```python
+result = producer.send("events", {"a": 1})
+result.queued  # True = the LOCAL QUEUE accepted it
+result.failure_reason  # stable enum for a local rejection, or None
+result.retryable  # True only when local back-pressure may clear
+result.error_message  # why queueing failed, or None
+```
+
+**`queued=True` does not mean the message was delivered.** It means the local in-memory queue accepted it. The broker may not have it, and it may never arrive.
+
+That is not a limitation of the class — it is the definition of the pattern. No delivery callback was registered, so nothing in this process will ever learn the delivery outcome. A result object cannot report information the pattern deliberately declines to collect.
+
+`error_message` is populated only for **local** failures:
+
+| Failure | Reported? |
+|---|---|
+| Local queue full even after waiting | Yes — `queued=False` |
+| Message rejected by the client (e.g. too large) | Yes — `queued=False` |
+| Producer already closed | Yes — `queued=False` |
+| Invalid arguments (blank topic, non-serializable data) | Raises `ValueError` — a caller bug, not a runtime condition |
+| **Broker rejected it / broker unreachable / delivery timed out** | **No. Never. By design.** |
+
+Callers should branch on `failure_reason`, not text:
+
+```python
+from producers.fire_and_forget import SendFailureReason
+
+result = producer.send("telemetry", event)
+if result.failure_reason is SendFailureReason.QUEUE_FULL:
+    shed_or_buffer_elsewhere(event)
+```
+
+---
+
+## 7. When to use this, and when not to
+
+| Use fire-and-forget when… | Do **not** use it when… |
+|---|---|
+| High volume, each message cheap | Each message is valuable |
+| Losing a few is acceptable | Loss must be detected or prevented |
+| Throughput matters above all | You need to react to a failure |
+| *Examples:* metrics, logs, clickstream, telemetry, IoT sensor pings | *Examples:* payments, orders, sign-ups, inventory changes, audit logs |
+
+**Decision rule:** *"If one of these messages vanished and nobody noticed, is that acceptable?"*
+Yes → fire-and-forget. No → [callback-confirmed](../callback_confirmed/).
+
+**Can you make it safer without leaving the pattern?** Partly. This package already sets `acks="all"` and a bounded `delivery.timeout.ms`, so the broker side is durable and retried. But you still will not be *notified* of a final failure — and that notification is exactly what the next pattern adds.
+
+---
+
+## 8. Production checklist
+
+| Item | Why |
+|---|---|
+| List 2–3 brokers in `bootstrap.servers` | If the one address you listed is the broker that is down, the producer cannot start at all, even though the cluster is healthy. |
+| Set a meaningful `client.id` | During an incident, "which application is flooding this topic?" becomes answerable instead of guesswork. |
+| Topic `replication.factor=3`, `min.insync.replicas=2` | Without these, `acks="all"` can mean "one replica" — a far weaker guarantee than it sounds. |
+| Keep `delivery.timeout.ms` bounded | This, not `retries`, is what actually bounds retrying. `retries` defaults to effectively unlimited. |
+| Align `SHUTDOWN_FLUSH_TIMEOUT_SECONDS` with your platform's kill timeout | The 25-second default fits inside Kubernetes' common 30-second grace period, but your deployment may differ. |
+| Turn off `auto.create.topics.enable` on the broker | Otherwise a typo in a topic name silently creates a new topic instead of failing loudly. |
+| Always `close()` on shutdown | Queued messages are lost otherwise. Use the `with` form so it happens even on an exception. |
+| Decide consciously that silent loss is acceptable | If it is not, this is the wrong pattern. |
+
+---
+
+## 9. Prerequisites and running
+
+A reachable Kafka broker. For the local lab in [`infrastructure/`](../../infrastructure/):
+
+```bash
+cd infrastructure && docker compose up -d
+```
+
+Then:
+
+```bash
+# Default broker: localhost:9092
+python -m producers.fire_and_forget
+
+# Or point it elsewhere
+KAFKA_BOOTSTRAP_SERVERS=broker:9092 python -m producers.fire_and_forget
+```
+
+**The four tutorial scenes:**
+
+| Scene | Shows |
+|---|---|
+| 1 | `send()` returns without waiting to learn whether the broker stored the message |
+| 2 | The `produce` → `poll` → `flush` lifecycle, with real timings: queueing is nearly free, `flush()` is where the waiting happens |
+| 3 | The payoff: throughput from a single thread (~100k messages/second on a laptop) |
+| 4 | The honest weakness: a guaranteed delivery failure that produces no per-message error in the application result |
+
+---
+
+## 10. Testing
+
+```bash
+python -m unittest test.producer.test_fire_and_forget_producer
+```
+
+51 tests, **no broker required**. Every test injects a `FakeProducer` through the `producer_factory` argument, so the whole send path runs with no network — which is why [`types.py`](types.py) defines `KafkaProducerLike` as a `Protocol`: anything with the right three methods will do.
+
+The most important test is `TestFireAndForgetMechanism.test_never_registers_a_delivery_callback`. If a future change adds an `on_delivery` callback, the class stops being fire-and-forget, and that test fails to say so.
+
+---
+
+## 11. Related packages
+
+| Package | What it adds |
+|---|---|
+| [`producers.callback_confirmed`](../callback_confirmed/) | The same send, plus a delivery callback — so failures become visible instead of silent. The minimal next step from here. |
+| [`producers.singleton`](../singleton/) | A process-wide shared producer, with confirmation mode, local retry, and health metrics. **These four concerns used to live in this package** and made it hard to learn from; they are about producer lifecycle and operations, not about a delivery mode. |
+| [`producers.dead_letter_queue`](../dead_letter_queue/) | What to do when delivery fails: retry, circuit-break, and preserve the message for replay. |
+| [`producers.content_based_router`](../content_based_router/) | Choosing the destination topic from the message's own content. |
+
+For the step-by-step notebook version of this material, see [`notebook/producer_design_pattern/01_fire_and_forget.ipynb`](../../notebook/producer_design_pattern/01_fire_and_forget.ipynb).
