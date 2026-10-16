@@ -1,15 +1,165 @@
 # Callback-Confirmed Producer
 
-A complete, production-minded Kafka producer pattern with input validation, metadata preflight
-checks, delivery callbacks, and structured result objects.
+**Send asynchronously, but learn the final producer outcome of every locally
+accepted message.**
 
-This document assumes you are starting from zero. By the end you will understand what a Kafka
-producer is, why this specific pattern exists, how every configuration key behaves, how to tune
-it for production, and how to talk about it confidently in an interview.
+This package now follows the learning sequence in
+[`02_callback_confirmed_producer.ipynb`](../../notebook/producer_design_pattern/02_callback_confirmed_producer.ipynb).
+Start with the reusable publisher below. The older one-shot readiness and
+produce/consume helpers remain available later in this document for compatible
+operational scripts.
+
+## Start here: the five states
+
+```text
+publish(event)
+      |
+      v
+LOCAL QUEUE -- background networking --> KAFKA BROKER
+      |                                      |
+      | publish() returns event_id           | acknowledgement or final failure
+      | (not a delivery receipt)             v
+      |                                delivery event waits
+      |                                      |
+      +---------------- poll()/finish() ------+
+                                             |
+                                             v
+                                      your callback runs
+```
+
+| State | Plain meaning |
+|---|---|
+| **queued** | `produce()` accepted the message into this process's memory. |
+| **delivered** | The callback reported broker acknowledgement under the configured `acks` policy. |
+| **failed** | The callback reported a final producer delivery error. |
+| **awaiting callback** | The message was queued, but this application has not processed a final callback. |
+| **consumed** | A consumer later read the record. This is separate from producer delivery. |
+
+Three rules prevent most misunderstandings:
+
+1. `publish()` returning is local acceptance, not Kafka delivery.
+2. `poll()` serves ready callbacks; the Kafka client performs networking in the background.
+3. `flush()==0` does not prove success because failed messages also leave the queue.
+
+## Recommended reusable lifecycle
+
+```python
+from producers.callback_confirmed import CallbackConfirmedProducer
+
+publisher = CallbackConfirmedProducer(topic="orders.created.v1")
+summary = None
+
+try:
+    for order_number in range(3):
+        event = {
+            "event_id": f"event-{order_number}",
+            "event_type": "order.created",
+            "order_id": f"order-{order_number}",
+            "amount": 199,
+        }
+
+        event_id = publisher.publish(event)
+        print("accepted locally:", event_id)
+
+        # Zero means: run callbacks ready now, but do not wait for new ones.
+        publisher.poll(0.0)
+finally:
+    # One bounded wait at shutdown; do not flush after every event.
+    summary = publisher.finish()
+
+print(summary)
+print("every event confirmed:", summary.all_confirmed)
+```
+
+The lifecycle is deliberately one-way:
+
+```text
+create once -> publish many -> poll regularly -> finish once
+```
+
+Do not create a producer per message. Reuse preserves network connections and
+allows the Kafka client to batch several messages efficiently.
+
+The defaults teach order events. Other projects can reuse the same mechanics by
+setting `event_id_field`, `key_field`, and `required_event_fields` in the
+constructor; no Kafka delivery logic needs to be copied.
+
+## Reading `DeliverySummary`
+
+```python
+summary.queued             # accepted into the local queue
+summary.delivered          # callbacks reporting broker acknowledgement
+summary.failed             # callbacks reporting final delivery failure
+summary.awaiting_callback  # accepted, but no callback was observed
+summary.producer_remaining # client work left after the finish timeout
+summary.recent_failures    # bounded event-id/error samples; no payloads retained
+summary.all_confirmed      # honest final producer-level success decision
+```
+
+`all_confirmed=True` still does **not** prove that a consumer processed the
+event, updated a database, or completed a business workflow.
+
+## Back-pressure versus delivery failure
+
+These failures occur at different times and require different decisions:
+
+| Failure | Meaning | Package behavior |
+|---|---|---|
+| `BufferError` from `produce()` | Local queue rejected this enqueue attempt. The message was not accepted. | Poll briefly and retry the same event until one overall deadline. |
+| Error in delivery callback | A previously accepted message reached a final producer failure. | Count and sample the failure; do not blindly resend inside the callback. |
+
+Blindly resending a callback failure can duplicate a business event when the
+outcome is ambiguous. Use stable event IDs, idempotent consumers, and a durable
+outbox for business-critical database changes.
+
+## Module reading order
+
+| File | Responsibility |
+|---|---|
+| [`constants.py`](constants.py) | Named waiting budgets and tuning rationale. |
+| [`types.py`](types.py) | Client contracts and immutable operation results. |
+| [`config.py`](config.py) | Small, reliable confluent-kafka defaults. |
+| [`clients.py`](clients.py) | Third-party Kafka adapters and compatibility fallback. |
+| [`publisher.py`](publisher.py) | Primary notebook lifecycle: publish, poll, finish. |
+| [`core.py`](core.py) | Compatible one-shot helper with optional readiness preflight. |
+| [`demo.py`](demo.py) | Optional topic setup and consume-back teaching utilities. |
+
+Imports and flow-critical lines have nearby plain-language comments. Kafka and
+Python jargon is defined where it first affects a decision.
+
+## When this pattern is enough
+
+| Workload | Recommendation |
+|---|---|
+| Disposable logs or telemetry | Fire-and-forget may be sufficient. |
+| Normal service events | Callback confirmation, bounded queue handling, and metrics may be sufficient. |
+| Orders, payments, or DB state changes | Use callbacks, but also evaluate a transactional outbox and consumer idempotency. |
+
+Callback confirmation covers messages submitted to this producer. It cannot
+make a preceding database transaction and a later Kafka publish atomic.
+
+## Testing
+
+```bash
+python -m unittest test.producer.test_callback_confirmed_producer
+```
+
+The suite uses controlled fake producers for local acceptance, successful
+callbacks, failed callbacks, queue pressure, timeout, and unresolved shutdown.
+No Kafka broker is required.
 
 ---
 
-## Table of Contents
+## Additional reference: one-shot readiness and round-trip helpers
+
+The following older sections document the compatible `produce_message()` and
+`run_demo_round_trip()` APIs. They are useful for one-shot operational scripts,
+but a long-running service should normally start with
+`CallbackConfirmedProducer` above.
+
+---
+
+### Legacy reference contents
 
 1. [What Is Apache Kafka — 60-Second Primer](#1-what-is-apache-kafka--60-second-primer)
 2. [What Is a Producer](#2-what-is-a-producer)
@@ -96,16 +246,16 @@ simplicity, reliability, and performance.
 │  Risk: message may be lost silently. No way to know.                │
 │  When to use: logging, telemetry, non-critical events.              │
 ├─────────────────────────────────────────────────────────────────────┤
-│  PATTERN 2 — Callback-Confirmed ◄─── THIS PACKAGE                  │
+│  PATTERN 2 — Callback-Confirmed ◄─── THIS PACKAGE                   │
 │  produce() → poll() → flush() → delivery callback fires.            │
-│  Guarantees: callback tells you exactly what succeeded/failed.      │
-│  When to use: orders, payments, inventory, any critical business     │
-│  event where you need proof of delivery.                            │
+│  Outcome: callback reports producer-level success/failure.          │
+│  When to use: orders, payments, inventory, any critical business    │
+│  event where producer delivery failures must be observable.         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  PATTERN 3 — Transactional                                          │
 │  produce() multiple messages atomically. All or nothing.            │
 │  Risk: higher latency, more broker coordination overhead.           │
-│  When to use: exactly-once across multiple topics/partitions.       │
+│  When to use: atomic Kafka writes across multiple records.          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,13 +340,13 @@ messages into fewer network round trips.
 
 **Why `poll()` before `flush()`?**
 
-`poll()` gives the producer's I/O thread a chance to fire delivery callbacks for messages
-that have already been acknowledged. In a one-shot script (run → send → exit), without
-`poll()`, the callbacks may never fire at all because the process exits before the
-background threads can deliver them.
+Kafka networking continues in background client threads. `poll()` serves delivery
+callbacks whose results are ready; it does not perform the send itself. In a one-shot
+script, `poll()` or `flush()` must serve those callbacks before the process exits.
 
-`flush()` then blocks until the send buffer is fully drained. The return value is the number
-of messages still queued — zero means all messages reached the broker.
+`flush()` blocks until work reaches a final outcome or the timeout expires. Its return value
+is the amount of client work still outstanding. Zero does not prove success because final
+delivery failures also count as completed work; inspect callback outcomes as well.
 
 ---
 
@@ -281,13 +431,13 @@ This is the most important section. Follow the stages in [`core.py`](core.py) as
   │  Stage 4.1: Build producer client from config.      │
   │  Stage 4.2: Serialize message_value → UTF-8 JSON.   │
   │  Stage 4.3: producer.produce(topic, key, bytes,     │
-  │             callback=delivery_report)               │
+  │             on_delivery=delivery_report)            │
   │             → message enters local send buffer.     │
   │  Stage 4.4: producer.poll(timeout)                  │
   │             → serve callbacks for already-acked     │
   │             messages. Needed in short-lived scripts. │
   │  Stage 4.5: remaining = producer.flush(timeout)     │
-  │             → drain buffer. remaining==0 means ok.  │
+  │             → drain buffer; inspect callbacks too.  │
   │  Stage 4.6: remaining > 0 → timeout failure.        │
   └───────────────────────┬─────────────────────────────┘
                           │ ✓ flush drained (or error)
@@ -617,13 +767,13 @@ Returned by `verify_kafka_readiness()` before any produce attempt.
 ```python
 @dataclass(frozen=True)
 class KafkaReadinessReport:
-    ready: bool                    # True only if broker AND topic checks passed.
-    bootstrap_servers: str         # What endpoint was used for the metadata check.
-    broker_count: int              # How many brokers are visible in cluster metadata.
-    topic_name: str                # Which topic was checked.
-    topic_exists: bool             # Was the topic found in metadata?
-    topic_partition_count: int     # How many partitions does the topic have?
-    error_message: Optional[str]   # Actionable error string when ready=False.
+    ready: bool  # True only if broker AND topic checks passed.
+    bootstrap_servers: str  # What endpoint was used for the metadata check.
+    broker_count: int  # How many brokers are visible in cluster metadata.
+    topic_name: str  # Which topic was checked.
+    topic_exists: bool  # Was the topic found in metadata?
+    topic_partition_count: int  # How many partitions does the topic have?
+    error_message: Optional[str]  # Actionable error string when ready=False.
 ```
 
 **Why does this exist?** Without it, you would have to parse log strings to understand why
@@ -646,13 +796,13 @@ Returned by `produce_message()` — the top-level public API.
 ```python
 @dataclass(frozen=True)
 class ProduceMessageResult:
-    topic_name: str                # Which topic was targeted.
-    message_key: Optional[str]     # What key was used (affects partitioning).
-    success: bool                  # True only if flush drained completely.
-    serialized_size_bytes: int     # How large was the serialized payload.
+    topic_name: str  # Which topic was targeted.
+    message_key: Optional[str]  # What key was used (affects partitioning).
+    success: bool  # True only if flush drained completely.
+    serialized_size_bytes: int  # How large was the serialized payload.
     flush_remaining_messages: int  # Messages still in buffer after flush timeout.
-    readiness: KafkaReadinessReport # Nested preflight result.
-    error_message: Optional[str]   # Actionable error when success=False.
+    readiness: KafkaReadinessReport  # Nested preflight result.
+    error_message: Optional[str]  # Actionable error when success=False.
 ```
 
 **Why `flush_remaining_messages`?** A non-zero value means messages were in the local
@@ -671,11 +821,11 @@ Used by the teaching demo to confirm a produced message can be read back.
 ```python
 @dataclass(frozen=True)
 class ConsumedEventVerification:
-    consumed: bool                  # True if the expected event was found.
-    topic_name: str                 # Which topic was consumed from.
-    expected_demo_run_id: str       # The unique run ID we were looking for.
+    consumed: bool  # True if the expected event was found.
+    topic_name: str  # Which topic was consumed from.
+    expected_demo_run_id: str  # The unique run ID we were looking for.
     received_event: Optional[Dict]  # The actual event payload if found.
-    error_message: Optional[str]    # Why consume failed if consumed=False.
+    error_message: Optional[str]  # Why consume failed if consumed=False.
 ```
 
 **Why does this exist?** It separates two different failure modes:
@@ -828,8 +978,8 @@ High throughput, no strict ordering:                   5
 The three timeout constants in `constants.py` are tuned for one-shot demo scripts:
 
 ```python
-DEFAULT_POLL_TIMEOUT_SECONDS    = 1.0   # Fine for one-shot scripts.
-DEFAULT_FLUSH_TIMEOUT_SECONDS   = 10.0  # 10 seconds to drain buffer.
+DEFAULT_POLL_TIMEOUT_SECONDS = 1.0  # Fine for one-shot scripts.
+DEFAULT_FLUSH_TIMEOUT_SECONDS = 10.0  # 10 seconds to drain buffer.
 DEFAULT_METADATA_TIMEOUT_SECONDS = 5.0  # 5 seconds to verify broker reachability.
 ```
 

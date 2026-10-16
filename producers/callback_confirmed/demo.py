@@ -22,6 +22,8 @@ ASCII flow:
     Stage 5.0 Optionally consume back and verify run id
 """
 
+# Lets us write type hints like `Dict[str, Any]` below without Python
+# evaluating them immediately when this file loads.
 from __future__ import annotations
 
 # json: pretty event logging and consume payload deserialization.
@@ -39,6 +41,8 @@ from pathlib import Path
 # typing: explicit contracts for event payload and config dictionaries.
 from typing import Any, Dict
 
+# Raw client classes/exceptions this demo needs directly, mainly to create the
+# demo topic and to tell "topic already exists" apart from a real error.
 from .clients import (
     AdminClient,
     ConfluentNewTopic,
@@ -47,6 +51,9 @@ from .clients import (
     KafkaPythonNewTopic,
     TopicAlreadyExistsError,
 )
+
+# The one-shot produce workflow and its config/logging helpers, reused here
+# so the demo follows the same reviewed path real callers would use.
 from .core import (
     ConfigLoader,
     Environment,
@@ -55,14 +62,26 @@ from .core import (
     produce_message,
     sanitize_config_for_logging,
 )
+# The reusable configuration path mirrors the reference notebook defaults.
+from .config import build_callback_producer_config
+# The primary publisher owns the publish/poll/finish lifecycle demonstrated here.
+from .publisher import CallbackConfirmedProducer
+
+# Result objects returned by this demo's functions, so callers get the same
+# structured, typed outcomes as the rest of the package.
 from .types import (
     ConsumedEventVerification,
     DemoRoundTripResult,
+    DeliverySummary,
     KafkaReadinessReport,
     ProduceMessageResult,
 )
 
 logger = logging.getLogger(__name__)
+
+# Use a stable, dedicated learning topic. The helper below creates it if absent
+# but never deletes or recreates it, so existing lab records remain safe.
+CALLBACK_CONFIRMED_DEMO_TOPIC: str = "callback-confirmed-orders-v1"
 
 
 def _is_topic_already_exists_error(create_error: Exception) -> bool:
@@ -123,11 +142,16 @@ def build_order_created_demo_event() -> Dict[str, Any]:
     """
 
     current_epoch_ms = int(time.time() * 1000)
+    demo_run_id = f"demo-run-{current_epoch_ms}"
     return {
+        # event_id uniquely identifies this event for callback correlation.
+        "event_id": demo_run_id,
+        # event_type tells generic consumers which business fact occurred.
+        "event_type": "order.created",
         "event_name": "order_created",
         "event_version": "v1",
         "event_timestamp_epoch_ms": current_epoch_ms,
-        "demo_run_id": f"demo-run-{current_epoch_ms}",
+        "demo_run_id": demo_run_id,
         "order_id": "ord-demo-20260420-0001",
         "customer_id": "customer-1024",
         "currency": "INR",
@@ -135,6 +159,48 @@ def build_order_created_demo_event() -> Dict[str, Any]:
         "source_service": "checkout-service",
         "notes": "Demo event used to teach simple Kafka producer flow.",
     }
+
+
+def run_callback_confirmed_demo() -> DeliverySummary:
+    """Run the notebook's reusable publish/poll/finish lifecycle once.
+
+    Returns:
+        Final producer-delivery counters. ``all_confirmed`` is true only when
+        the success callback was observed and no work remains unresolved.
+
+    Failure behavior:
+        Topic setup, client creation, validation, and immediate publish errors
+        propagate with their traceback. ``finally`` still calls finish after a
+        publisher exists, giving locally accepted work a bounded shutdown wait.
+    """
+    # Stage 1.0: Resolve the lab broker and build one realistic order event.
+    bootstrap_servers = read_demo_bootstrap_servers()
+    demo_event = build_order_created_demo_event()
+    # Stage 1.1: Create the dedicated topic without deleting existing data.
+    ensure_demo_topic_exists(CALLBACK_CONFIRMED_DEMO_TOPIC, bootstrap_servers)
+    # Stage 1.2: Use the same reviewed reliability defaults as normal callers.
+    producer_config = build_callback_producer_config(
+        bootstrap_servers=bootstrap_servers,
+        client_id="callback-confirmed-teaching-demo",
+    )
+
+    # Stage 2.0: Create one client and reuse it for the whole application lifecycle.
+    publisher = CallbackConfirmedProducer(
+        topic=CALLBACK_CONFIRMED_DEMO_TOPIC,
+        config=producer_config,
+    )
+    try:
+        # Stage 2.1: publish() confirms only local queue acceptance.
+        event_id = publisher.publish(demo_event)
+        logger.info("Event accepted into local queue: event_id=%s", event_id)
+        # Stage 3.0: serve callbacks that are ready now without waiting.
+        publisher.poll(0.0)
+    finally:
+        # Stage 4.0: flush once at shutdown and capture callback-aware accounting.
+        summary = publisher.finish()
+
+    # Return the immutable summary so callers decide whether failure is acceptable.
+    return summary
 
 
 def log_producer_teaching_summary(producer_config: Dict[str, Any]) -> None:

@@ -6,6 +6,13 @@ Why this module exists:
 - separate input validation, readiness checks, and send execution responsibilities
 - return structured outcomes that support debugging and interview-style explanation
 
+When to use this module vs. :class:`producers.callback_confirmed.publisher.CallbackConfirmedProducer`:
+- `produce_message` here is for a single one-shot send (a short script, a cron
+  job, a migration task) that creates a producer, sends one message, and exits.
+- `CallbackConfirmedProducer` is for a long-lived process that publishes many
+  events and should reuse one Kafka client and its connections/batches. Prefer
+  it for services and notebooks that publish more than one event.
+
 ASCII flow:
     Stage 1.0 Validate input
           |
@@ -22,6 +29,8 @@ ASCII flow:
     Stage 5.0 Return ProduceMessageResult with actionable status
 """
 
+# Lets us write type hints like `Optional[str]` below without Python
+# evaluating them immediately when this file loads.
 from __future__ import annotations
 
 # json serialization is the wire-format boundary for event payloads.
@@ -33,12 +42,21 @@ import logging
 # typing keeps workflow contracts explicit and tooling-friendly.
 from typing import Any, Dict, Optional
 
+# The two ready-made functions this module uses to build a Kafka producer and
+# a Kafka admin (metadata) client, with confluent_kafka/kafka-python fallback
+# already handled inside them.
 from .clients import default_admin_client_factory, default_producer_factory
+
+# Named wait-time defaults so the numbers below have an explained meaning
+# instead of being unlabeled "magic numbers".
 from .constants import (
     DEFAULT_FLUSH_TIMEOUT_SECONDS,
     DEFAULT_METADATA_TIMEOUT_SECONDS,
     DEFAULT_POLL_TIMEOUT_SECONDS,
 )
+
+# Shared type contracts and result objects used by the functions below, so
+# tests and callers can rely on one stable shape for each outcome.
 from .types import (
     AdminClientFactory,
     ConfigLoader,
@@ -48,12 +66,9 @@ from .types import (
     ProducerFactory,
 )
 
-# Primary import path for repository execution.
-try:
-    from config.kafka_config import Environment, get_producer_config
-except ImportError:  # pragma: no cover - package install fallback.
-    # Fallback import path when package is installed under `kafka.*`.
-    from kafka.config.kafka_config import Environment, get_producer_config
+# Environment/get_producer_config live in the top-level `config` package so
+# every producer and consumer shares one reviewed source of broker settings.
+from config.kafka_config import Environment, get_producer_config
 
 logger = logging.getLogger("producers.callback_confirmed_producer")
 
@@ -166,7 +181,7 @@ def serialize_message_value(message_value: Any) -> bytes:
 
 def create_callback_confirmed_producer(
     *,
-    environment: Environment = Environment.PRODUCTION,
+    environment: Environment = Environment.DEVELOPMENT,
     config_loader: ConfigLoader = get_producer_config,
     producer_factory: ProducerFactory = default_producer_factory,
 ):
@@ -175,6 +190,11 @@ def create_callback_confirmed_producer(
 
     This helper is useful when callers want direct producer access while reusing
     the same configuration and logging standards as the callback-confirmed flow.
+
+    The default is `Environment.DEVELOPMENT`, not production, so that calling
+    this without arguments never silently targets the hardcoded production
+    broker addresses in `config/kafka_config.py`. Production use must pass
+    `environment=Environment.PRODUCTION` explicitly.
     """
 
     producer_config = config_loader(environment=environment)
@@ -310,7 +330,7 @@ def produce_message(
     message_key: Optional[str],
     message_value: Any,
     *,
-    environment: Environment = Environment.PRODUCTION,
+    environment: Environment = Environment.DEVELOPMENT,
     config_loader: ConfigLoader = get_producer_config,
     producer_factory: ProducerFactory = default_producer_factory,
     admin_client_factory: AdminClientFactory = default_admin_client_factory,
@@ -328,6 +348,8 @@ def produce_message(
     - readiness check can fail fast before producing
     - flush result decides success/failure for short-lived scripts
     - `raise_on_error` lets callers choose strict exception semantics
+    - `environment` defaults to development so an unspecified call never
+      silently targets the hardcoded production brokers in `config/kafka_config.py`
     """
 
     # Stage 1.0: Validate caller inputs before networking or serialization.
@@ -336,7 +358,11 @@ def produce_message(
     # Stage 2.0: Load environment-specific producer configuration.
     producer_config = config_loader(environment=environment)
 
-    # Default readiness object for flows that skip metadata preflight.
+    # Default readiness object for flows that skip metadata preflight. `ready`
+    # is True because the caller explicitly chose not to check, not because
+    # brokers/topic were verified. `broker_count=0` and `topic_partition_count=0`
+    # are stand-ins, not real metadata, so `error_message` says so explicitly;
+    # otherwise a reader could mistake "0 brokers" for a real readiness result.
     readiness_report = KafkaReadinessReport(
         ready=True,
         bootstrap_servers=str(producer_config.get("bootstrap.servers", "")),
@@ -344,6 +370,7 @@ def produce_message(
         topic_name=topic_name,
         topic_exists=True,
         topic_partition_count=0,
+        error_message="Readiness check skipped (verify_readiness=False); broker/topic details were not verified.",
     )
 
     # Stage 3.0: Metadata preflight (recommended for deterministic failures).
@@ -401,7 +428,9 @@ def produce_message(
             topic=topic_name,
             key=message_key,
             value=payload_bytes,
-            callback=callback_tracking_wrapper,
+            # on_delivery is the defining difference from fire-and-forget:
+            # this function later receives final producer success or failure.
+            on_delivery=callback_tracking_wrapper,
         )
 
         # Stage 4.4: Allow callbacks to execute, then drain producer queue.

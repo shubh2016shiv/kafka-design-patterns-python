@@ -19,6 +19,8 @@ ASCII flow:
     uniform contract returned to core workflow
 """
 
+# Lets us write type hints like `Dict[str, Any]` below without Python
+# evaluating them immediately when this file loads.
 from __future__ import annotations
 
 # logging: operational breadcrumbs for fallback decisions and compatibility behavior.
@@ -30,6 +32,9 @@ import time
 # typing: explicit contracts for config and callback interfaces.
 from typing import Any, Callable, Dict, Optional
 
+# These are the two "shape contracts" from types.py: any producer/admin client
+# built in this file must expose the methods they describe (produce/poll/flush
+# for a producer, list_topics for an admin client).
 from .types import KafkaAdminClientLike, KafkaProducerLike
 
 logger = logging.getLogger(__name__)
@@ -126,6 +131,11 @@ class KafkaPythonProducerAdapter:
 
         # Stage 1.1: Create producer with safe compression fallback when codec
         # is configured but not available in the local Python runtime.
+        # kafka-python has no typed exception for this; it raises a bare
+        # AssertionError with this message text, so detection is necessarily
+        # string-based and will stop matching if the library's wording changes.
+        # Re-check this against the installed kafka-python version if the
+        # fallback silently stops triggering.
         try:
             self._producer = KafkaPythonProducer(**producer_kwargs)
         except AssertionError as exc:
@@ -140,7 +150,12 @@ class KafkaPythonProducerAdapter:
             self._producer = KafkaPythonProducer(**producer_kwargs)
 
     def produce(
-        self, topic: str, key: Optional[str], value: bytes, callback: Callable[..., None]
+        self,
+        topic: str,
+        key: Optional[str],
+        value: bytes,
+        callback: Optional[Callable[..., None]] = None,
+        on_delivery: Optional[Callable[..., None]] = None,
     ) -> None:
         """
         Queue a message and map kafka-python futures into callback style.
@@ -152,10 +167,16 @@ class KafkaPythonProducerAdapter:
           adapter so downstream logging remains uniform.
         """
 
+        # Confluent calls this keyword ``on_delivery`` while older code may use
+        # its ``callback`` alias. Accept both, but require one clear function.
+        selected_callback = on_delivery or callback
+        if selected_callback is None:
+            raise ValueError("A delivery callback is required.")
+
         send_future = self._producer.send(topic, key=key, value=value)
 
         def on_success(record_metadata: Any) -> None:
-            callback(
+            selected_callback(
                 None,
                 KafkaPythonProducedMessage(
                     topic_name=record_metadata.topic,
@@ -165,7 +186,7 @@ class KafkaPythonProducerAdapter:
             )
 
         def on_error(exception: Exception) -> None:
-            callback(exception, None)
+            selected_callback(exception, None)
 
         send_future.add_callback(on_success)
         send_future.add_errback(on_error)
@@ -223,6 +244,13 @@ class KafkaPythonAdminClientAdapter:
         Failure behavior:
         - raises ImportError when kafka-python is unavailable
         - closes consumer resources in all paths
+
+        Tradeoff:
+        kafka-python exposes no public API for broker metadata, so this reaches
+        into the private `_client.cluster` attribute (`# noqa: SLF001`). That
+        attribute is not a stable contract; it can change across kafka-python
+        releases without notice. Prefer `confluent_kafka.admin.AdminClient`
+        (used automatically when installed) for anything beyond local learning.
         """
 
         if KafkaPythonConsumer is None:
@@ -269,11 +297,24 @@ def default_producer_factory(config: Dict[str, Any]) -> KafkaProducerLike:
     Fall back to `kafka-python` adapter for local compatibility.
     Stage 1.2:
     Raise a clear ImportError when no supported client is available.
+
+    Operational note:
+    This fallback is intentionally silent about *which* client was chosen
+    beyond one warning log line. A production deployment that expects
+    `confluent_kafka` (the project's primary client per `pyproject.toml`) but
+    actually falls back to kafka-python would otherwise run on a different
+    client than intended with no visible signal. Watch for this warning, or
+    pass an explicit `producer_factory` to remove the ambiguity entirely.
     """
 
     if Producer is not None:
         return Producer(config)
     if KafkaPythonProducer is not None:
+        logger.warning(
+            "confluent_kafka is not installed; falling back to the kafka-python "
+            "producer adapter. This is a degraded path not recommended for "
+            "production use -- install `confluent_kafka` to use the primary client."
+        )
         return KafkaPythonProducerAdapter(config)
     raise ImportError(
         "No supported Kafka producer client is installed. Install `confluent_kafka` "
@@ -296,6 +337,11 @@ def default_admin_client_factory(config: Dict[str, Any]) -> KafkaAdminClientLike
     if AdminClient is not None:
         return AdminClient({"bootstrap.servers": config["bootstrap.servers"]})
     if KafkaPythonConsumer is not None:
+        logger.warning(
+            "confluent_kafka is not installed; falling back to the kafka-python "
+            "admin adapter, which reads a private client attribute for broker "
+            "metadata. This is a degraded path not recommended for production use."
+        )
         return KafkaPythonAdminClientAdapter(config["bootstrap.servers"])
     raise ImportError(
         "No supported Kafka metadata client is installed. Install `confluent_kafka` "
