@@ -498,10 +498,10 @@ An incident on the background-tasks topic has zero impact on the high-priority l
 **Convenience send methods built on this rule:**
 
 ```python
-router.send_high_priority(data)       # → TopicPriority.HIGH
-router.send_medium_priority(data)     # → TopicPriority.MEDIUM
-router.send_low_priority(data)        # → TopicPriority.LOW
-router.send_background(data)          # → TopicPriority.BACKGROUND
+router.send_high_priority(data)  # → TopicPriority.HIGH
+router.send_medium_priority(data)  # → TopicPriority.MEDIUM
+router.send_low_priority(data)  # → TopicPriority.LOW
+router.send_background(data)  # → TopicPriority.BACKGROUND
 ```
 
 **Production tip:** This rule is always installed in `ContentBasedRouter.__init__()` before
@@ -521,13 +521,13 @@ a topic name.
 
 ```python
 ContentBasedRoutingRule(
-    match_field="event_type",          # which payload field to inspect
-    value_to_topic={                   # value → topic mapping
+    match_field="event_type",  # which payload field to inspect
+    value_to_topic={  # value → topic mapping
         "payment.completed": "payments-completed",
-        "payment.failed":    "payments-failed",
-        "auth.login":        "auth-events",
+        "payment.failed": "payments-failed",
+        "auth.login": "auth-events",
     },
-    rule_weight=50,                    # optional: override default weight
+    rule_weight=50,  # optional: override default weight
 )
 ```
 
@@ -550,17 +550,21 @@ backed by a configuration service.
 **Stacking multiple content rules:**
 
 ```python
-router.add_routing_rule(ContentBasedRoutingRule(
-    match_field="region",
-    value_to_topic={"eu-west": "events-eu", "us-east": "events-us"},
-    rule_weight=80,   # evaluate before the default content rule
-))
+router.add_routing_rule(
+    ContentBasedRoutingRule(
+        match_field="region",
+        value_to_topic={"eu-west": "events-eu", "us-east": "events-us"},
+        rule_weight=80,  # evaluate before the default content rule
+    )
+)
 
-router.add_routing_rule(ContentBasedRoutingRule(
-    match_field="event_type",
-    value_to_topic={"payment.failed": "payments-failed"},
-    rule_weight=50,
-))
+router.add_routing_rule(
+    ContentBasedRoutingRule(
+        match_field="event_type",
+        value_to_topic={"payment.failed": "payments-failed"},
+        rule_weight=50,
+    )
+)
 ```
 
 Both rules coexist in the chain. The region rule (weight=80) runs first; if it matches,
@@ -579,10 +583,10 @@ The same field value always produces the same bucket index — this is determini
 
 ```python
 HashPartitionRoutingRule(
-    hash_field="user_id",          # payload field to hash
-    topic_prefix="user-events",    # topic name prefix
-    num_buckets=4,                 # number of parallel topic buckets
-    rule_weight=30,                # optional: override default weight
+    hash_field="user_id",  # payload field to hash
+    topic_prefix="user-events",  # topic name prefix
+    num_buckets=4,  # number of parallel topic buckets
+    rule_weight=30,  # optional: override default weight
 )
 ```
 
@@ -651,6 +655,7 @@ Extend `RoutingRule` and implement three methods:
 from producers.content_based_router.core import RoutingRule
 from producers.content_based_router.types import MessageRoutingContext, RoutingStrategy
 
+
 class TenantRoutingRule(RoutingRule):
     """
     Routes messages to tenant-specific topics for multi-tenant architectures.
@@ -658,9 +663,9 @@ class TenantRoutingRule(RoutingRule):
     """
 
     TENANT_TOPICS = {
-        "acme-corp":      "acme-corp-events",
-        "globex-inc":     "globex-events",
-        "initech-llc":    "initech-events",
+        "acme-corp": "acme-corp-events",
+        "globex-inc": "globex-events",
+        "initech-llc": "initech-events",
     }
 
     def matches(self, context: MessageRoutingContext, data: dict) -> bool:
@@ -675,6 +680,7 @@ class TenantRoutingRule(RoutingRule):
 
     def routing_strategy(self) -> RoutingStrategy:
         return RoutingStrategy.CUSTOM
+
 
 # Register it:
 router.add_routing_rule(TenantRoutingRule())
@@ -694,15 +700,15 @@ The routing envelope that travels with every outbound message.
 ```python
 @dataclass
 class MessageRoutingContext:
-    priority: TopicPriority           # Required. Routing lane selector.
-    category: Optional[str] = None   # Free-text label for content rules.
+    priority: TopicPriority  # Required. Routing lane selector.
+    category: Optional[str] = None  # Free-text label for content rules.
     source_service: Optional[str] = None  # Stamped into message headers.
     target_service: Optional[str] = None  # For direct-routing rules.
-    user_id: Optional[str] = None    # For hash-partition rules.
+    user_id: Optional[str] = None  # For hash-partition rules.
     tenant_id: Optional[str] = None  # For multi-tenant routing.
     routing_key: Optional[str] = None  # Arbitrary string for custom rules.
     processing_timeout_ms: Optional[int] = None  # Consumer SLA hint.
-    retry_count: int = 0             # Re-attempt count for DLQ poison-pill detection.
+    retry_count: int = 0  # Re-attempt count for DLQ poison-pill detection.
 ```
 
 **Why not just inspect the payload dict?**
@@ -737,10 +743,10 @@ Immutable record of one completed routing evaluation.
 ```python
 @dataclass(frozen=True)
 class RoutingDecision:
-    target_topic: str      # The Kafka topic selected.
-    resolved_by: str       # Class name of the matching rule, or "fallback".
+    target_topic: str  # The Kafka topic selected.
+    resolved_by: str  # Class name of the matching rule, or "fallback".
     strategy: RoutingStrategy  # Which routing strategy was used.
-    used_fallback: bool    # True when no rule matched.
+    used_fallback: bool  # True when no rule matched.
 ```
 
 **Why return this instead of just routing silently?**
@@ -777,11 +783,11 @@ making them useful for deduplication and metrics aggregation.
 
 ```python
 class RoutingStrategy(Enum):
-    PRIORITY_BASED = "priority_based"   # TopicPriority → lane selection
-    CONTENT_BASED  = "content_based"    # Payload field value → topic
-    HASH_PARTITION = "hash_partition"   # hash(field) % N → bucket topic
-    DIRECT         = "direct"           # Bypass routing; caller names topic
-    CUSTOM         = "custom"           # Application-defined rule
+    PRIORITY_BASED = "priority_based"  # TopicPriority → lane selection
+    CONTENT_BASED = "content_based"  # Payload field value → topic
+    HASH_PARTITION = "hash_partition"  # hash(field) % N → bucket topic
+    DIRECT = "direct"  # Bypass routing; caller names topic
+    CUSTOM = "custom"  # Application-defined rule
 ```
 
 **Why an Enum instead of string constants?**
@@ -810,6 +816,7 @@ compatible — no inheritance required. This is **structural subtyping**.
 # Production: SingletonProducerGateway satisfies KafkaMessageDispatcher.
 router = ContentBasedRouter("payments-service")
 
+
 # Tests: a simple fake also satisfies it — no real broker needed.
 class FakeDispatcher:
     def __init__(self):
@@ -820,6 +827,7 @@ class FakeDispatcher:
 
     def flush(self, timeout):
         return 0  # nothing queued
+
 
 fake = FakeDispatcher()
 router = ContentBasedRouter("payments-service", dispatcher=fake)
@@ -889,9 +897,9 @@ Interactive services (frequent flush): 5.0 seconds
 ### Routing Header Key Strings
 
 ```python
-HEADER_KEY_PRIORITY         = "x-routing-priority"
-HEADER_KEY_CATEGORY         = "x-routing-category"
-HEADER_KEY_SOURCE_SERVICE   = "x-routing-source-service"
+HEADER_KEY_PRIORITY = "x-routing-priority"
+HEADER_KEY_CATEGORY = "x-routing-category"
+HEADER_KEY_SOURCE_SERVICE = "x-routing-source-service"
 HEADER_KEY_ROUTING_STRATEGY = "x-routing-strategy"
 ```
 
@@ -967,6 +975,7 @@ class RecordingDispatcher:
 
     def flush(self, timeout):
         return 0
+
 
 fake = RecordingDispatcher()
 router = ContentBasedRouter("order-service", dispatcher=fake)
@@ -1065,8 +1074,7 @@ For Lambda functions, cron jobs, and CLI tools:
 remaining = router.flush(timeout=30.0)
 if remaining > 0:
     logger.warning(
-        "Flush incomplete: %d messages still in buffer. "
-        "They will be lost when the process exits.",
+        "Flush incomplete: %d messages still in buffer. They will be lost when the process exits.",
         remaining,
     )
     sys.exit(1)  # Signal to the orchestrator that cleanup failed.

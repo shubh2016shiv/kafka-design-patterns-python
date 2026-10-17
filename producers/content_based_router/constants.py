@@ -1,78 +1,87 @@
 """
-Content-Based Router — tunable defaults.
+Content-Based Router — tunable default values (one place to find and change them).
 
-Why this module exists:
-  Keep every default value in one auditable file so operators can find and
-  tune them without hunting through logic files.  Each constant below includes
-  a production-tuning note so the rationale survives beyond the initial commit.
+What this file is for:
+    Every "magic number" and fixed string the router uses lives here, with a
+    short note on what it controls and when you might change it. Keeping them in
+    one file means an operator can tune behavior without reading the logic code.
+
+Plain-language terms used below:
+    topic        a named stream of messages inside Kafka (like a mailbox name)
+    prefix       text we put in front of every topic name so related topics
+                 group together, e.g. "ecommerce.orders", "ecommerce.payments"
+    local queue  memory inside the producer that briefly holds messages that
+                 have not been sent to Kafka yet
+    flush        wait for the producer to finish sending everything it is holding
+    header       a small label attached to a message that consumers can read
+                 without opening the full message body
 """
 
-# ---------------------------------------------------------------------------
-# Rule evaluation weights
-# ---------------------------------------------------------------------------
+# ============================================================================
+# STEP 1: Topic naming
+# ============================================================================
 
-PRIORITY_RULE_WEIGHT: int = 100
-"""
-Evaluation weight for PriorityRoutingRule.
+# We never let the outside world hand us a raw topic name. Instead we build the
+# name ourselves from this prefix plus a fixed suffix (".orders", ".payments").
+# A single, known prefix keeps all of this app's topics grouped and prevents
+# accidental writes to unrelated topics.
+#
+# Change this when: you run more than one app on the same Kafka cluster and want
+# each app's topics kept separate (e.g. "billing", "shipping").
+DEFAULT_TOPIC_PREFIX: str = "ecommerce"
 
-Higher weight = evaluated first in the sorted rule chain.
 
-Priority-based routing is the most common production pattern — routing HIGH /
-MEDIUM / LOW / BACKGROUND traffic to separate topic lanes is almost always the
-first dimension you add.  Keeping this weight the highest ensures it acts as
-the primary lane selector before more specific content or hash rules fire.
+# ============================================================================
+# STEP 2: Waiting limits (so the app never hangs forever)
+# ============================================================================
 
-Tune: if content-based rules should override priority lanes, raise their
-weight above 100.
-"""
+# When the producer's local queue is temporarily full, publishing one message
+# can fail with a "queue full" signal. We retry for at most this many seconds,
+# then give up with a clear timeout error instead of looping forever.
+#
+# Change this when: a slow or overloaded broker needs more breathing room (raise
+# it), or a web request must fail fast and shed load (lower it).
+DEFAULT_QUEUE_WAIT_SECONDS: float = 3.0
 
-CONTENT_RULE_DEFAULT_WEIGHT: int = 50
-"""
-Default evaluation weight for ContentBasedRoutingRule.
+# While we wait for the full queue to drain, we ask the producer to do a little
+# work in short slices of this length. Short slices keep the app responsive and
+# let the overall deadline above stay in charge of when we finally give up.
+QUEUE_FULL_POLL_INTERVAL_SECONDS: float = 0.2
 
-Content rules are more specific than priority rules but require a matching
-field to be present in the payload, so they sit below the priority lane by
-default.  Pass a custom `weight=` to ContentBasedRoutingRule.__init__ to
-promote or demote individual rules relative to each other.
-"""
-
-HASH_PARTITION_RULE_DEFAULT_WEIGHT: int = 30
-"""
-Default evaluation weight for HashPartitionRoutingRule.
-
-Hash rules act as a load-distribution tie-breaker; they should run after
-business-logic rules have had a chance to match first.
-
-Tune: if you want strict per-entity partitioning regardless of content rules,
-raise this weight above CONTENT_RULE_DEFAULT_WEIGHT.
-"""
-
-# ---------------------------------------------------------------------------
-# Flush / timeout defaults
-# ---------------------------------------------------------------------------
-
+# At shutdown the application asks the producer to send everything it still
+# holds. This is the longest we are willing to wait for that final drain.
+# 30 seconds matches the Kafka client's own default request timeout.
+#
+# Change this when: integration tests want a short wait (e.g. 5 seconds), or a
+# busy production service needs more headroom for a transient slowdown.
 DEFAULT_FLUSH_TIMEOUT_SECONDS: float = 30.0
-"""
-Maximum seconds to block on producer.flush().
 
-Matches the Kafka client default request.timeout.ms (30 000 ms).
-Reducing to 5 s is appropriate for integration tests that use a local broker.
-In production, 30 s provides enough headroom for transient broker slowness
-without blocking the application thread indefinitely.
-"""
 
-# ---------------------------------------------------------------------------
-# Header keys stamped onto every routed message
-# ---------------------------------------------------------------------------
+# ============================================================================
+# STEP 3: The business rules the router understands
+# ============================================================================
 
-HEADER_KEY_PRIORITY: str = "x-routing-priority"
-"""Kafka message header key carrying the TopicPriority value string."""
+# The only event types this router knows how to route. Anything else is
+# rejected on purpose so a typo or a brand-new event never slips through to a
+# random topic. Add a new type here (and a matching rule in routing.py) when the
+# business genuinely needs it.
+SUPPORTED_EVENT_TYPES: tuple[str, ...] = (
+    "order.created",
+    "payment.updated",
+    "inventory.changed",
+)
 
-HEADER_KEY_CATEGORY: str = "x-routing-category"
-"""Kafka message header key carrying the optional message category label."""
+# A payment event must carry one of these statuses. Any other value is a
+# validation error, not something we quietly route somewhere.
+VALID_PAYMENT_STATUSES: frozenset[str] = frozenset({"PENDING", "SUCCEEDED", "FAILED"})
 
-HEADER_KEY_SOURCE_SERVICE: str = "x-routing-source-service"
-"""Kafka message header key identifying the originating service."""
 
-HEADER_KEY_ROUTING_STRATEGY: str = "x-routing-strategy"
-"""Kafka message header key recording which RoutingStrategy resolved the topic."""
+# ============================================================================
+# STEP 4: Message header labels
+# ============================================================================
+
+# We stamp these two labels onto every published message. Consumers and tracing
+# tools can read them without decoding the whole message body, which makes it
+# easy to follow one event across systems or spot a mis-routed message.
+HEADER_KEY_EVENT_ID: str = "event_id"
+HEADER_KEY_EVENT_TYPE: str = "event_type"

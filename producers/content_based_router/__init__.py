@@ -1,68 +1,83 @@
 """
 producers.content_based_router
-==============================
-Enterprise Integration Pattern: Content-Based Router (Hohpe & Woolf, ch.7).
+===============================
+A content-based router for Kafka: it reads a business event, decides which
+topic that event belongs in, and publishes it through ONE shared producer.
 
-Routes outbound Kafka messages to different topic lanes based on message
-metadata (priority), payload field values (content-based), or entity hash
-(partition fan-out).  Application code never hardcodes a topic name.
+The router chooses the destination; the producer sends the bytes. Choosing a
+topic is not the same as confirming delivery — publish() means the message was
+accepted locally, and the real delivery result is counted later via callbacks.
 
-Public API
-----------
-Classes:
-    ContentBasedRouter       — main router class; holds the rule chain.
-    MessageRoutingContext     — routing envelope attached to each message.
-    RoutingDecision          — immutable outcome of one routing evaluation.
-    RoutingStrategy          — enum of supported routing variants.
-    RoutingRule              — abstract base for custom rules.
-    PriorityRoutingRule      — routes by TopicPriority lane (most common).
-    ContentBasedRoutingRule  — routes by payload field value.
-    HashPartitionRoutingRule — routes by hash(field) % N buckets.
+What each piece does
+--------------------
+Building and checking events:
+    make_event            wrap business data in the shared event envelope.
+    validate_event        reject malformed or unknown events before routing.
+    serialize_event       turn a validated event into the bytes Kafka carries.
 
-Factories:
-    create_priority_router   — pre-configured for priority-lane routing.
-    create_content_router    — pre-configured with content-based rules.
+Deciding the destination (pure, no Kafka):
+    route_event           return a RouteDecision(topic, key, reason).
+    RouteDecision         the chosen topic + partition key + reason label.
+
+Publishing through a shared producer:
+    KafkaEventRouter      validate -> route -> publish -> count delivery results.
+    PublishReceipt        proof of LOCAL acceptance (not delivery) from publish().
+    build_shared_producer create the one reliable producer to inject.
+
+Error types:
+    EventValidationError  the event is malformed (a local, pre-Kafka mistake).
+    UnknownEventTypeError there is no routing rule for this event type.
+    LocalQueueTimeoutError the producer's local queue stayed full too long.
 
 Quickstart
 ----------
     from producers.content_based_router import (
-        ContentBasedRouter,
-        MessageRoutingContext,
-        TopicPriority,
+        KafkaEventRouter,
+        build_shared_producer,
+        make_event,
     )
 
-    router = ContentBasedRouter("order-service")
-    router.send_with_priority({"order_id": 1}, priority=TopicPriority.HIGH)
+    producer = build_shared_producer()          # once, at application startup
+    router = KafkaEventRouter(producer)
+
+    receipt = router.publish(make_event(
+        "order.created",
+        {"order_id": "ORD-1", "customer_id": "CUST-1"},
+    ))
+    # receipt means LOCAL acceptance; check router.snapshot() for delivery.
+
+    producer.flush(30)                           # once, at application shutdown
 """
 
-from .core import (
-    ContentBasedRouter,
-    ContentBasedRoutingRule,
-    HashPartitionRoutingRule,
-    PriorityRoutingRule,
-    RoutingRule,
-    create_content_router,
-    create_priority_router,
-)
+from .clients import build_shared_producer
+from .core import KafkaEventRouter
+from .events import make_event, require_nonempty_string, serialize_event, validate_event
+from .routing import route_event
 from .types import (
-    MessageRoutingContext,
-    RoutingDecision,
-    RoutingStrategy,
+    EventValidationError,
+    KafkaProducerLike,
+    LocalQueueTimeoutError,
+    PublishReceipt,
+    RouteDecision,
+    UnknownEventTypeError,
 )
 
 __all__ = [
-    # Router
-    "ContentBasedRouter",
-    # Rules
-    "RoutingRule",
-    "PriorityRoutingRule",
-    "ContentBasedRoutingRule",
-    "HashPartitionRoutingRule",
-    # Types
-    "MessageRoutingContext",
-    "RoutingDecision",
-    "RoutingStrategy",
-    # Factories
-    "create_priority_router",
-    "create_content_router",
+    # Events
+    "make_event",
+    "validate_event",
+    "require_nonempty_string",
+    "serialize_event",
+    # Routing
+    "route_event",
+    "RouteDecision",
+    # Router + producer
+    "KafkaEventRouter",
+    "PublishReceipt",
+    "build_shared_producer",
+    "KafkaProducerLike",
+    # Errors
+    "EventValidationError",
+    "UnknownEventTypeError",
+    "LocalQueueTimeoutError",
 ]

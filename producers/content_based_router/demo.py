@@ -1,201 +1,165 @@
 """
-Content-Based Router — educational demo entrypoint.
+Content-Based Router — runnable teaching demo.
 
-Run this module directly to walk through all three routing strategies with
-annotated console output.  No live Kafka broker is required — the demo catches
-connection errors and shows which routing decision would have been made.
+What this file is for:
+    Show the router end to end with five realistic events. By default it runs
+    OFFLINE using a tiny in-memory producer, so you can see routing work with no
+    Kafka broker installed. An opt-in LIVE path publishes to a real broker.
 
-    python -m producers.content_based_router.demo
-
-What you will observe:
-  Stage A — Priority-based routing  (HIGH / MEDIUM / LOW / BACKGROUND lanes)
-  Stage B — Content-based routing   (field value → specific topic)
-  Stage C — Hash-partition routing  (user_id hash → one of N topic buckets)
-  Stage D — Direct send             (bypass all rules, name the topic explicitly)
-  Stage E — Routing metrics report
+The five sample events exercise every routing branch:
+    1. order.created                       -> .orders
+    2. payment.updated SUCCEEDED           -> .payments
+    3. payment.updated FAILED              -> .payments.failed
+    4. inventory.changed, low stock        -> .inventory.alerts
+    5. inventory.changed, healthy stock    -> .inventory
 """
 
 from __future__ import annotations
 
+# json: deserialize a message body in the demo producer so it can read event_id.
+import json
+
+# logging: print the routing decisions as readable, labeled lines.
 import logging
-import time
-from typing import Any, Dict
 
-from .constants import DEFAULT_FLUSH_TIMEOUT_SECONDS
-from .core import (
-    ContentBasedRouter,
-    ContentBasedRoutingRule,
-    HashPartitionRoutingRule,
-    create_priority_router,
-)
-from .types import MessageRoutingContext, RoutingDecision
+# deque: a simple first-in/first-out holder for messages waiting for a callback.
+from collections import deque
 
-try:
-    from config.kafka_config import TopicPriority
-except ImportError:  # pragma: no cover
-    from kafka.config.kafka_config import TopicPriority  # type: ignore[no-redef]
+from .clients import build_shared_producer
+from .core import KafkaEventRouter
+from .events import make_event
+from .types import PublishReceipt
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("content_based_router.demo")
-
-SERVICE_NAME = "demo-service"
+logger = logging.getLogger("producers.content_based_router.demo")
 
 
-def _print_decision(label: str, decision: RoutingDecision) -> None:
-    """Pretty-print a RoutingDecision for educational console output."""
-    print(
-        f"  ✓ {label}\n"
-        f"    topic      = {decision.target_topic}\n"
-        f"    resolved by = {decision.resolved_by}\n"
-        f"    strategy   = {decision.strategy.value}\n"
-        f"    fallback?  = {decision.used_fallback}\n"
-    )
+# ============================================================================
+# STEP 1: sample events — one per routing branch
+# ============================================================================
 
 
-def _try_send(
-    router: ContentBasedRouter,
-    label: str,
-    data: Dict[str, Any],
-    **kwargs: Any,
-) -> None:
+def build_sample_events() -> list[dict]:
+    """Return five events, one for each possible routing destination."""
+    return [
+        make_event("order.created", {"order_id": "ORD-101", "customer_id": "CUST-7"}),
+        make_event(
+            "payment.updated",
+            {"payment_id": "PAY-200", "order_id": "ORD-101", "status": "SUCCEEDED"},
+        ),
+        make_event(
+            "payment.updated",
+            {"payment_id": "PAY-201", "order_id": "ORD-102", "status": "FAILED"},
+        ),
+        make_event(
+            "inventory.changed",
+            {"sku": "LAPTOP-15", "available_units": 2, "reorder_point": 5},
+        ),
+        make_event(
+            "inventory.changed",
+            {"sku": "MOUSE-9", "available_units": 50, "reorder_point": 5},
+        ),
+    ]
+
+
+# ============================================================================
+# STEP 2: a tiny in-memory producer so the demo runs without Kafka
+# ============================================================================
+
+
+class _InMemoryProducer:
+    """A stand-in producer for the offline demo. It never contacts Kafka.
+
+    It records each message and, when poll()/flush() runs, reports every pending
+    message as delivered successfully. This is only enough to demonstrate the
+    router's flow — it does not imitate real brokers, partitions, or failures.
     """
-    Attempt a send and report the routing decision whether or not Kafka is live.
 
-    The routing decision is always deterministic regardless of broker availability —
-    the rule chain runs before any network I/O.  If the broker is unreachable the
-    demo prints the error but continues, so you can study routing logic offline.
+    def __init__(self) -> None:
+        self._pending: deque = deque()
+
+    def produce(self, *, topic, key, value, on_delivery=None, headers=None) -> None:
+        """Accept a message into the local queue and remember its callback."""
+        self._pending.append((topic, value, on_delivery))
+
+    def _deliver_all(self) -> None:
+        """Report every pending message as delivered, running its callback."""
+        while self._pending:
+            topic, value, on_delivery = self._pending.popleft()
+            if on_delivery is not None:
+                # A real client passes a message object; the demo passes None for
+                # the error (success) and a simple label for the message.
+                on_delivery(None, f"delivered:{topic}")
+            # Reading the id back proves the payload is valid JSON bytes.
+            json.loads(value)
+
+    def poll(self, timeout: float) -> int:
+        """Run any ready callbacks; returns how many were delivered."""
+        before = len(self._pending)
+        self._deliver_all()
+        return before
+
+    def flush(self, timeout: float) -> int:
+        """Deliver everything still pending; returns remaining (always 0 here)."""
+        self._deliver_all()
+        return 0
+
+
+# ============================================================================
+# STEP 3: offline demo — route five events with no broker
+# ============================================================================
+
+
+def run_offline_demo() -> dict:
+    """Publish the five sample events through an in-memory producer.
+
+    Returns the router's final snapshot of counters so a caller (or __main__)
+    can print and check them.
     """
+    producer = _InMemoryProducer()
+    router = KafkaEventRouter(producer)
+
+    receipts: list[PublishReceipt] = []
+    for event in build_sample_events():
+        receipt = router.publish(event)
+        receipts.append(receipt)
+        logger.info(
+            "routed event_id=%s -> topic=%s (%s)",
+            receipt.event_id,
+            receipt.topic,
+            receipt.route_reason,
+        )
+
+    # Drain anything still waiting, then report honest counts.
+    producer.flush(5)
+    return router.snapshot()
+
+
+# ============================================================================
+# STEP 4: live demo — publish to a real broker (opt-in)
+# ============================================================================
+
+
+def run_live_demo() -> dict:
+    """Publish the five sample events to a real Kafka broker.
+
+    Requires confluent_kafka and a reachable broker (see KAFKA_BOOTSTRAP_SERVERS).
+    The topics must already exist; creating topics is an operator/admin task, not
+    something an application should do on every startup.
+    """
+    producer = build_shared_producer(client_id="content-based-router-demo")
+    router = KafkaEventRouter(producer)
+
     try:
-        decision = router.send_with_context(data, kwargs.pop("context"), **kwargs)
-        _print_decision(label, decision)
-    except Exception as exc:
-        print(f"  ✗ {label} — broker unreachable ({exc}); routing decision still logged above.\n")
+        for event in build_sample_events():
+            receipt = router.publish(event)
+            logger.info(
+                "local acceptance event_id=%s -> topic=%s",
+                receipt.event_id,
+                receipt.topic,
+            )
+    finally:
+        # The caller owns the producer, so the demo flushes the one it created.
+        remaining = producer.flush(30)
+        logger.info("flush remaining=%d", remaining)
 
-
-def run_demo() -> None:
-    """Execute all routing strategy demonstrations in sequence."""
-    timestamp = int(time.time())
-
-    print("\n" + "=" * 64)
-    print("  Content-Based Router — Pattern Demonstration")
-    print("=" * 64 + "\n")
-
-    # ----------------------------------------------------------------
-    # Stage A: Priority-based routing
-    # ----------------------------------------------------------------
-    print("Stage A — Priority-Based Routing")
-    print("  Rule: PriorityRoutingRule (weight=100) maps TopicPriority")
-    print("        to separate topic lanes via get_topic_name().\n")
-
-    router = create_priority_router(SERVICE_NAME)
-
-    for priority, label in [
-        (TopicPriority.HIGH, "HIGH   → high-priority lane"),
-        (TopicPriority.MEDIUM, "MEDIUM → medium-priority lane"),
-        (TopicPriority.LOW, "LOW    → low-priority lane"),
-        (TopicPriority.BACKGROUND, "BACKGROUND → background-tasks lane"),
-    ]:
-        payload = {"timestamp": timestamp, "demo_stage": "A", "priority_label": label}
-        context = MessageRoutingContext(priority=priority, source_service=SERVICE_NAME)
-        try:
-            decision = router.send_with_context(payload, context)
-            _print_decision(label, decision)
-        except Exception as exc:
-            # Routing decision already resolved; broker error is expected offline.
-            print(f"  ✗ {label} — broker unreachable ({exc})\n")
-
-    # ----------------------------------------------------------------
-    # Stage B: Content-based routing
-    # ----------------------------------------------------------------
-    print("Stage B — Content-Based Routing")
-    print("  Rule: ContentBasedRoutingRule inspects payload['event_type']")
-    print("        and maps its value directly to a topic.")
-    print("        Context priority is intentionally omitted so content rules can lead.\n")
-
-    router.add_routing_rule(
-        ContentBasedRoutingRule(
-            match_field="event_type",
-            value_to_topic={
-                "payment.completed": f"{SERVICE_NAME}-payments-completed",
-                "payment.failed": f"{SERVICE_NAME}-payments-failed",
-                "auth.login": f"{SERVICE_NAME}-auth-events",
-            },
-            rule_weight=50,
-        )
-    )
-
-    for event_type in ["payment.completed", "payment.failed", "auth.login"]:
-        payload = {"timestamp": timestamp, "demo_stage": "B", "event_type": event_type}
-        context = MessageRoutingContext(
-            category=event_type,
-            source_service=SERVICE_NAME,
-        )
-        try:
-            decision = router.send_with_context(payload, context)
-            _print_decision(f"event_type={event_type!r}", decision)
-        except Exception as exc:
-            print(f"  ✗ event_type={event_type!r} — broker unreachable ({exc})\n")
-
-    # ----------------------------------------------------------------
-    # Stage C: Hash-partition routing
-    # ----------------------------------------------------------------
-    print("Stage C — Hash-Partition Routing")
-    print("  Rule: HashPartitionRoutingRule hashes payload['user_id']")
-    print("        modulo 3 to distribute across 3 topic buckets.")
-    print("        Context priority is intentionally omitted so hash routing can lead.\n")
-
-    NUM_BUCKETS = 3
-    router.add_routing_rule(
-        HashPartitionRoutingRule(
-            hash_field="user_id",
-            topic_prefix=f"{SERVICE_NAME}-user-shard",
-            num_buckets=NUM_BUCKETS,
-            rule_weight=30,
-        )
-    )
-
-    for user_id in ["user-001", "user-002", "user-003", "user-999"]:
-        payload = {"timestamp": timestamp, "demo_stage": "C", "user_id": user_id}
-        context = MessageRoutingContext(
-            user_id=user_id,
-            source_service=SERVICE_NAME,
-        )
-        try:
-            decision = router.send_with_context(payload, context)
-            _print_decision(f"user_id={user_id!r}", decision)
-        except Exception as exc:
-            print(f"  ✗ user_id={user_id!r} — broker unreachable ({exc})\n")
-
-    # ----------------------------------------------------------------
-    # Stage D: Direct send (bypass all rules)
-    # ----------------------------------------------------------------
-    print("Stage D — Direct Send (rule chain bypassed)")
-    print("  Use when the correct topic is already known at the call site.\n")
-
-    direct_topic = f"{SERVICE_NAME}-audit-log"
-    direct_payload = {"timestamp": timestamp, "demo_stage": "D", "event": "admin_action"}
-    try:
-        router.send_direct(direct_topic, direct_payload)
-        print(f"  ✓ Sent directly to topic='{direct_topic}'\n")
-    except Exception as exc:
-        print(f"  ✗ Direct send — broker unreachable ({exc})\n")
-
-    # ----------------------------------------------------------------
-    # Stage E: Routing metrics
-    # ----------------------------------------------------------------
-    print("Stage E — Routing Metrics Report")
-    print("  These counters power operational dashboards and health checks.\n")
-
-    metrics = router.get_routing_metrics()
-    for key, value in metrics.items():
-        print(f"  {key:30s} = {value}")
-
-    print("\n" + "=" * 64)
-    print("  Demo complete.  Study core.py to see the rule chain in detail.")
-    print("=" * 64 + "\n")
-
-    router.flush(timeout=DEFAULT_FLUSH_TIMEOUT_SECONDS)
-
-
-if __name__ == "__main__":
-    run_demo()
+    return router.snapshot()

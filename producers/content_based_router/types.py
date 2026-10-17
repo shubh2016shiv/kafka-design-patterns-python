@@ -1,183 +1,155 @@
 """
-Content-Based Router — shared type contracts.
+Content-Based Router — shared data shapes and error types.
 
-Why this module exists:
-  All data shapes used by routing rules and the router class live here.
-  Centralising them means adding a new routing dimension (e.g. geo-region routing)
-  only requires extending MessageRoutingContext — rule and router code stays stable.
+What this file is for:
+    1. The small result objects the router hands back (RouteDecision,
+       PublishReceipt), so callers and tests get a stable, typed shape.
+    2. The error types we raise so callers can tell a *business* mistake (bad
+       event) apart from an *infrastructure* problem (queue stayed full).
+    3. The producer "shape contract" (KafkaProducerLike) so real Kafka clients
+       and a fake test producer can both be used without changing router code.
 
-ASCII contract map:
+ASCII flow — where each shape appears:
 
-    Caller builds MessageRoutingContext
-               │
-               ▼
-    ContentBasedRouter._resolve_target_topic(context, payload)
-               │  (evaluates rules in weight order)
-               ▼
-    RoutingRule.matches(context, payload) ──True──► RoutingRule.get_topic(context, payload)
-               │                                              │
-               │  (no match — try next rule)                  │
-               ▼                                              ▼
-          fallback topic                              RoutingDecision(used_fallback=False)
-               │
-               ▼
-    RoutingDecision(used_fallback=True)
+    event dict
+        |
+        v
+    route_event(event) -----------------> RouteDecision(topic, key, reason)
+        |   (bad event raises)                    |
+        v                                         v
+    EventValidationError / UnknownEventTypeError  |
+                                                  v
+    KafkaEventRouter.publish(event) ------> PublishReceipt(event_id, topic, ...)
+        |   (local queue stays full)
+        v
+    LocalQueueTimeoutError
 """
 
+# Lets us write type hints like `int | None` without Python checking them the
+# instant this file loads. Purely a convenience for cleaner hints below.
 from __future__ import annotations
 
-# dataclass: lightweight value objects with auto __repr__ and __eq__ — no boilerplate.
+# dataclass: a decorator that turns a small class into a plain "value object".
+# It writes the __init__, a readable __repr__, and value-based equality for us,
+# so we do not hand-write that boilerplate.
 from dataclasses import dataclass
 
-# Enum: named constants prevent magic-string bugs and surface allowed values in IDEs.
-from enum import Enum
-
-# Optional, Protocol: explicit nullability and structural typing for clean interfaces.
-from typing import Any, Dict, Optional, Protocol
-
-# TopicPriority is the shared vocabulary between the config layer and routing rules.
-# It maps to actual Kafka topic suffixes defined in kafka_config.py.
-try:
-    from config.kafka_config import TopicPriority
-except ImportError:  # pragma: no cover — fallback for installed-package layout.
-    from kafka.config.kafka_config import TopicPriority  # type: ignore[no-redef]
+# Any: "a value of any type" (used where the Kafka client owns the real type).
+# Protocol: lets us describe a type by the methods it has, not by what it
+# inherits from. See KafkaProducerLike at the bottom for what that buys us.
+from typing import Any, Protocol
 
 
-class RoutingStrategy(Enum):
-    """
-    Enumerates the routing strategies supported by this package.
+# ============================================================================
+# STEP 1: Error types — tell business mistakes apart from infrastructure faults
+# ============================================================================
 
-    Use this enum instead of magic strings when selecting or logging which
-    strategy resolved a target topic.  Adding a new variant here forces
-    callers that branch on the value to handle it explicitly.
 
-    Interview note — when to choose each strategy:
+class EventValidationError(ValueError):
+    """Raised when an event's structure or business fields are invalid.
 
-        PRIORITY_BASED  — Most common production pattern.  Route to separate
-                          HIGH / MEDIUM / LOW / BACKGROUND topic lanes so each
-                          tier can be scaled and monitored independently.
-
-        CONTENT_BASED   — Route on a field value inside the payload
-                          (e.g. event_type="payment" → payments-topic).
-                          Useful when one service produces heterogeneous events.
-
-        HASH_PARTITION  — Deterministic fan-out: hash(user_id) % N selects topic-N.
-                          Preserves per-entity ordering across N parallel topics
-                          while still enabling horizontal consumer scaling.
-
-        DIRECT          — Caller names the topic explicitly; routing is a pass-through.
-                          Use when the topic is already known at the call site.
-
-        CUSTOM          — Application-defined rule registered at runtime via
-                          ContentBasedRouter.add_routing_rule().
+    This is a *local* mistake found before we ever talk to Kafka — for example
+    a missing order id, or a payment with no status. It is NOT a delivery
+    failure. The caller should fix or reject the event, not retry sending it.
     """
 
-    PRIORITY_BASED = "priority_based"
-    CONTENT_BASED = "content_based"
-    HASH_PARTITION = "hash_partition"
-    DIRECT = "direct"
-    CUSTOM = "custom"
 
+class UnknownEventTypeError(EventValidationError):
+    """Raised when there is no routing rule for this event's type.
 
-@dataclass
-class MessageRoutingContext:
+    We subclass EventValidationError so a caller that catches validation errors
+    also catches this one, but a caller that cares specifically about "unknown
+    type" (e.g. to return a 422 vs a 400) can still catch it on its own.
     """
-    Routing envelope attached to every outbound message.
 
-    Why a separate object instead of inspecting the raw payload dict directly:
-    - Decouples routing logic from payload schema changes.  A payload field rename
-      does not break routing rules.
-    - Gives rules a stable, typed surface to match against.
-    - Makes routing decisions fully observable: log this object to know exactly
-      what information drove the topic selection.
 
-    Production tip:
-      In high-throughput systems, populate only the fields your rules actually
-      use — unused optional fields carry zero routing overhead.
+class LocalQueueTimeoutError(TimeoutError):
+    """Raised when the producer's local queue stayed full past our deadline.
+
+    This means the producer could not even accept the message locally within
+    the time we allowed. It is different from a delivery failure, which happens
+    *after* the message was accepted and is reported through a callback instead.
+    """
+
+
+# ============================================================================
+# STEP 2: RouteDecision — the pure "where should this go?" answer
+# ============================================================================
+
+
+# frozen=True makes instances read-only after creation, so a decision cannot be
+# edited by accident once the router has made it.
+@dataclass(frozen=True)
+class RouteDecision:
+    """The destination chosen for one event, with no Kafka call involved yet.
 
     Fields:
-        priority            — Optional Kafka lane selector that maps to TopicPriority.
-                              Set this when you want explicit priority-lane routing.
-                              Leave as None when content/hash/custom rules should
-                              decide the topic first.
-
-        category            — Free-text label for content-based rules.
-                              Examples: "payment", "notification", "audit".
-
-        source_service      — Originating service name.  Stamped into Kafka message
-                              headers so consumers know who produced the event.
-
-        target_service      — Intended consuming service; used by direct-routing rules
-                              to resolve a canonical topic without hardcoding strings.
-
-        user_id             — User scope for hash-partition routing rules.
-
-        tenant_id           — Tenant scope for multi-tenant fan-out architectures.
-
-        routing_key         — Arbitrary string for custom rule matching.
-
-        processing_timeout_ms — Consumer SLA hint in milliseconds.  Informational;
-                              no Kafka protocol enforcement occurs.
-
-        retry_count         — Number of prior delivery attempts for this message.
-                              Dead-letter routing rules use this to detect poison pills
-                              (e.g. retry_count >= 3 → route to DLQ topic).
+        topic   the Kafka topic this event should be written to.
+        key     the partition key: events sharing a key land on the same
+                partition *within that topic*, which keeps them in order there.
+        reason  a short label explaining which rule chose this topic, useful
+                for logs and tests (e.g. "payment_failed", "stock_healthy").
     """
 
-    priority: Optional[TopicPriority] = None
-    category: Optional[str] = None
-    source_service: Optional[str] = None
-    target_service: Optional[str] = None
-    user_id: Optional[str] = None
-    tenant_id: Optional[str] = None
-    routing_key: Optional[str] = None
-    processing_timeout_ms: Optional[int] = None
-    retry_count: int = 0
+    topic: str
+    key: str
+    reason: str
+
+
+# ============================================================================
+# STEP 3: PublishReceipt — proof of LOCAL acceptance, not delivery
+# ============================================================================
 
 
 @dataclass(frozen=True)
-class RoutingDecision:
-    """
-    Immutable record of one completed routing evaluation.
+class PublishReceipt:
+    """Returned by publish() once the producer has accepted the event locally.
 
-    Why this exists:
-    - Makes routing decisions observable without string-parsing log output.
-    - Tests can assert on structured objects rather than log strings.
-    - Enables routing metrics to accumulate without side-effecting core logic.
+    Important: holding this receipt means "the producer took the message into
+    its outbound queue", NOT "Kafka stored it". The real delivery result arrives
+    later through the delivery callback and is counted in the router's snapshot.
 
     Fields:
-        target_topic    — Kafka topic the router selected for this message.
-        resolved_by     — Class name of the matching rule, or "fallback" when no
-                          rule matched and the default topic was used.
-        strategy        — RoutingStrategy variant that produced this decision.
-        used_fallback   — True when the rule chain exhausted without a match.
+        event_id      the event's own id, handy for correlating logs.
+        topic         the topic the event was routed to.
+        key           the partition key that was used.
+        route_reason  same reason string as the RouteDecision that chose it.
     """
 
-    target_topic: str
-    resolved_by: str
-    strategy: RoutingStrategy
-    used_fallback: bool
+    event_id: str
+    topic: str
+    key: str
+    route_reason: str
 
 
-class KafkaMessageDispatcher(Protocol):
+# ============================================================================
+# STEP 4: KafkaProducerLike — the minimum a producer must offer
+# ============================================================================
+
+
+class KafkaProducerLike(Protocol):
+    """The small set of methods the router needs from any producer.
+
+    Why a Protocol instead of a shared base class: the real `confluent_kafka.
+    Producer` and the `FakeProducer` we use in tests do not inherit from a
+    common parent. A Protocol says "any object with these three methods counts
+    as a producer here", so both work without being forced into an inheritance
+    tree. This is what lets the tests run with no Kafka broker installed.
     """
-    Minimal interface the ContentBasedRouter requires from its Kafka backend.
 
-    Why a Protocol instead of an ABC:
-    - Structural typing lets any object that satisfies the shape be used as a
-      dispatcher — no inheritance required.
-    - Tests inject a fake dispatcher without touching production Kafka clients.
-    - SingletonProducer, confluent Producer, and kafka-python Producer all satisfy
-      this contract; the router stays backend-agnostic.
-    """
+    def produce(
+        self,
+        *,
+        topic: str,
+        key: bytes,
+        value: bytes,
+        on_delivery: Any = None,
+        headers: Any = None,
+    ) -> None:
+        """Hand one message to the producer's local outbound queue."""
 
-    def send(self, topic: str, data: Dict[str, Any], **kwargs: Any) -> None:
-        """Enqueue one message for delivery to the given topic."""
+    def poll(self, timeout: float) -> int:
+        """Let the producer do pending work, such as running delivery callbacks."""
 
     def flush(self, timeout: float) -> int:
-        """
-        Wait for queued messages to drain and return remaining queue size.
-
-        A return value > 0 means some messages did not drain within `timeout`
-        seconds — the caller should decide whether to retry or raise.
-        """
+        """Wait for queued messages to drain; return how many are still waiting."""
